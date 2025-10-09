@@ -1,0 +1,769 @@
+import asyncio
+import time
+import json
+import random
+import os
+import sys
+from pathlib import Path
+from browser_manager import setup_stealth_browser
+from db_config import get_collection, upsert_object_smart
+
+# Директория текущего скрипта
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+# Файлы для работы
+INPUT_JSON = PROJECT_ROOT / 'domrf_houses.json'
+PROGRESS_FILE = PROJECT_ROOT / 'object_details_progress.json'
+
+# Настройки повторных попыток
+MAX_RETRIES = 3
+RETRY_DELAY = 5
+
+
+async def fetch_flats_api_in_browser(page, obj_id, flat_type, limit=100, offset=0):
+    """Выполняет API запрос для получения данных о квартирах"""
+    api_url = f"https://xn--80az8a.xn--d1aqf.xn--p1ai/portal-kn/api/kn/objects/{obj_id}/flats"
+    params = {
+        'flatGroupType': flat_type,
+        'limit': limit,
+        'offset': offset
+    }
+    
+    query = "&".join(f"{k}={v}" for k, v in params.items())
+    url = f"{api_url}?{query}"
+    
+    js_code = f'''
+        async () => {{
+            try {{
+                const resp = await fetch("{url}", {{
+                    headers: {{
+                        'accept': 'application/json, text/plain, */*',
+                        'authorization': 'Basic MTpxd2U=',
+                        'sec-fetch-dest': 'empty',
+                        'sec-fetch-mode': 'cors',
+                        'sec-fetch-site': 'same-origin'
+                    }},
+                    method: 'GET',
+                    mode: 'cors',
+                    credentials: 'include'
+                }});
+                if (!resp.ok) return null;
+                return await resp.json();
+            }} catch (e) {{
+                console.log('Ошибка при запросе API квартир:', e);
+                return null;
+            }}
+        }}
+    '''
+    return await page.evaluate(js_code)
+
+
+async def get_all_flats_for_type(page, obj_id, flat_type):
+    """Получает все квартиры определенного типа с пагинацией"""
+    all_flats = []
+    offset = 0
+    limit = 100
+    page_num = 1
+    consecutive_errors = 0  # Счетчик последовательных ошибок
+    max_consecutive_errors = 3  # Максимальное количество последовательных ошибок
+    
+    while True:
+        try:
+            print(f"  Получаем страницу {page_num} для {flat_type} (offset={offset}, limit={limit})")
+            flats_data = await fetch_flats_api_in_browser(page, obj_id, flat_type, limit, offset)
+            
+            if not flats_data:
+                consecutive_errors += 1
+                print(f"  ❌ Ошибка или пустой ответ для {flat_type} на offset={offset} (ошибка {consecutive_errors}/{max_consecutive_errors})")
+                
+                if consecutive_errors >= max_consecutive_errors:
+                    print(f"  🛑 Превышено максимальное количество ошибок ({max_consecutive_errors}) для {flat_type}. Переходим к следующему типу.")
+                    break
+                else:
+                    # Пробуем увеличить offset и повторить запрос
+                    offset += limit
+                    page_num += 1
+                    await asyncio.sleep(0.5)  # Увеличенная задержка при ошибке
+                    continue
+                
+            # Если получили данные, сбрасываем счетчик ошибок
+            consecutive_errors = 0
+                
+            # Проверяем структуру ответа
+            if 'data' in flats_data and isinstance(flats_data['data'], list):
+                flats = flats_data['data']
+                if not flats:
+                    print(f"  ✅ Получены все квартиры типа {flat_type}. Всего: {len(all_flats)}")
+                    break
+                    
+                all_flats.extend(flats)
+                print(f"  📄 Получено {len(flats)} квартир, всего: {len(all_flats)}")
+                
+                # Если получили меньше запрошенного количества, значит это последняя страница
+                if len(flats) < limit:
+                    print(f"  ✅ Получены все квартиры типа {flat_type}. Всего: {len(all_flats)}")
+                    break
+                    
+            elif isinstance(flats_data, list):
+                # Если ответ - это просто массив квартир
+                flats = flats_data
+                if not flats:
+                    print(f"  ✅ Получены все квартиры типа {flat_type}. Всего: {len(all_flats)}")
+                    break
+                    
+                all_flats.extend(flats)
+                print(f"  📄 Получено {len(flats)} квартир, всего: {len(all_flats)}")
+                
+                # Если получили меньше запрошенного количества, значит это последняя страница
+                if len(flats) < limit:
+                    print(f"  ✅ Получены все квартиры типа {flat_type}. Всего: {len(all_flats)}")
+                    break
+            else:
+                consecutive_errors += 1
+                print(f"  ❌ Неожиданная структура ответа для {flat_type} (ошибка {consecutive_errors}/{max_consecutive_errors})")
+                
+                if consecutive_errors >= max_consecutive_errors:
+                    print(f"  🛑 Превышено максимальное количество ошибок ({max_consecutive_errors}) для {flat_type}. Переходим к следующему типу.")
+                    break
+                else:
+                    offset += limit
+                    page_num += 1
+                    await asyncio.sleep(0.5)
+                    continue
+            
+            # Переходим к следующей странице
+            offset += limit
+            page_num += 1
+            
+            # Небольшая задержка между запросами
+            await asyncio.sleep(0.2)
+            
+        except Exception as e:
+            consecutive_errors += 1
+            print(f"  ❌ Ошибка при получении страницы {page_num} для {flat_type}: {e} (ошибка {consecutive_errors}/{max_consecutive_errors})")
+            
+            if consecutive_errors >= max_consecutive_errors:
+                print(f"  🛑 Превышено максимальное количество ошибок ({max_consecutive_errors}) для {flat_type}. Переходим к следующему типу.")
+                break
+            else:
+                # Пробуем продолжить с увеличенным offset
+                offset += limit
+                page_num += 1
+                await asyncio.sleep(0.5)  # Увеличенная задержка при ошибке
+    
+    return {
+        'flats': all_flats,
+        'total_count': len(all_flats),
+        'consecutive_errors': consecutive_errors
+    }
+
+
+async def extract_construction_progress(page):
+    """Извлекает данные о ходе строительства и фотографиях"""
+    try:
+        construction_data = await page.evaluate('''() => {
+            const result = {
+                'construction_stages': [],
+                'photos': []
+            };
+            
+            try {
+                // Ищем секцию "ХОД СТРОИТЕЛЬСТВА" по классу
+                const constructionSection = document.querySelector('[class*="ConstructionProgressWrapper"]');
+                
+                if (constructionSection) {
+                    console.log('Найдена секция хода строительства');
+                    
+                    // Ищем все карточки этапов строительства
+                    const stageCards = document.querySelectorAll('[class*="ConstructionProgressCard_CardWrapper"]');
+                    console.log('Найдено карточек этапов:', stageCards.length);
+                    
+                    stageCards.forEach((card, index) => {
+                        try {
+                            const stage = {};
+                            
+                            // Извлекаем дату этапа из h4 с классом Date
+                            const dateElement = card.querySelector('h4[class*="Date"]');
+                            if (dateElement) {
+                                stage.date = dateElement.innerText.trim();
+                                console.log('Найдена дата:', stage.date);
+                            }
+                            
+                            // Извлекаем количество фото из span с классом PhotosCount
+                            const photosCountElement = card.querySelector('span[class*="PhotosCount"]');
+                            if (photosCountElement) {
+                                stage.photos_count = photosCountElement.innerText.trim();
+                                console.log('Найдено количество фото:', stage.photos_count);
+                            }
+                            
+                            // Извлекаем дату последнего обновления из span с классом LastUpdate
+                            const lastUpdateElement = card.querySelector('span[class*="LastUpdate"]');
+                            if (lastUpdateElement) {
+                                stage.last_update = lastUpdateElement.innerText.trim();
+                                console.log('Найдена дата обновления:', stage.last_update);
+                            }
+                            
+                            // Извлекаем ссылки на фотографии из img с классом Preview
+                            const images = card.querySelectorAll('img[class*="Preview"]');
+                            const photoUrls = [];
+                            images.forEach(img => {
+                                const src = img.src;
+                                if (src && !src.includes('data:') && !src.includes('placeholder')) {
+                                    photoUrls.push(src);
+                                    console.log('Найдено фото:', src);
+                                }
+                            });
+                            
+                            if (photoUrls.length > 0) {
+                                stage.photos = photoUrls;
+                                result.photos.push(...photoUrls);
+                            }
+                            
+                            // Добавляем этап, если есть хотя бы дата
+                            if (stage.date) {
+                                stage.stage_number = index + 1;
+                                result.construction_stages.push(stage);
+                                console.log('Добавлен этап:', stage);
+                            }
+                            
+                        } catch (cardError) {
+                            console.log('Ошибка при обработке карточки этапа:', cardError);
+                        }
+                    });
+                    
+                    // Если карточки не найдены, ищем альтернативным способом
+                    if (result.construction_stages.length === 0) {
+                        console.log('Карточки не найдены, ищем по тексту страницы');
+                        // Ищем по тексту страницы
+                        const pageText = document.body.innerText;
+                        const dateMatches = pageText.match(/([А-Яа-я]+,\\s*\\d{4})/g);
+                        
+                        if (dateMatches) {
+                            console.log('Найденные даты в тексте:', dateMatches);
+                            dateMatches.forEach((dateMatch, index) => {
+                                result.construction_stages.push({
+                                    stage_number: index + 1,
+                                    date: dateMatch.trim(),
+                                    photos_count: '',
+                                    last_update: '',
+                                    photos: []
+                                });
+                            });
+                        }
+                    }
+                    
+                    // Ищем все фотографии в секции строительства
+                    const allImages = constructionSection.querySelectorAll('img[src]');
+                    allImages.forEach(img => {
+                        const src = img.src;
+                        if (src && !src.includes('data:') && !result.photos.includes(src)) {
+                            result.photos.push(src);
+                        }
+                    });
+                    
+                } else {
+                    console.log('Секция хода строительства не найдена');
+                    // Fallback: ищем по тексту страницы
+                    const pageText = document.body.innerText;
+                    if (pageText.includes('ХОД СТРОИТЕЛЬСТВА')) {
+                        console.log('Найден текст "ХОД СТРОИТЕЛЬСТВА", ищем даты');
+                        const dateMatches = pageText.match(/([А-Яа-я]+,\\s*\\d{4})/g);
+                        if (dateMatches) {
+                            dateMatches.forEach((dateMatch, index) => {
+                                result.construction_stages.push({
+                                    stage_number: index + 1,
+                                    date: dateMatch.trim(),
+                                    photos_count: '',
+                                    last_update: '',
+                                    photos: []
+                                });
+                            });
+                        }
+                    }
+                }
+                
+                console.log('Итоговый результат:', result);
+                
+            } catch (e) {
+                console.log('Ошибка при извлечении данных о ходе строительства:', e);
+            }
+            
+            return result;
+        }''')
+        
+        return construction_data
+        
+    except Exception as e:
+        print(f"Ошибка при извлечении данных о ходе строительства: {e}")
+        return {
+            'construction_stages': [],
+            'photos': []
+        }
+
+
+def load_progress():
+    """Загружает сохраненный прогресс из файла"""
+    if os.path.exists(PROGRESS_FILE):
+        try:
+            with open(PROGRESS_FILE, 'r', encoding='utf-8') as f:
+                progress = json.load(f)
+                print(f"Загружен прогресс: обработано {len(progress.get('processed_ids', []))} объектов")
+                return progress
+        except Exception as e:
+            print(f"Ошибка при загрузке прогресса: {e}")
+    return {'processed_ids': [], 'failed_ids': []}
+
+
+def save_progress(processed_ids, failed_ids):
+    """Сохраняет текущий прогресс в файл"""
+    try:
+        # json не умеет сериализовать set — конвертируем в списки
+        if isinstance(processed_ids, set):
+            processed_ids = list(processed_ids)
+        if isinstance(failed_ids, set):
+            failed_ids = list(failed_ids)
+
+        progress = {'processed_ids': processed_ids, 'failed_ids': failed_ids}
+        with open(PROGRESS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(progress, f, ensure_ascii=False, indent=2)
+        print(f"Прогресс сохранен: обработано {len(processed_ids)}, ошибок {len(failed_ids)}")
+    except Exception as e:
+        print(f"Ошибка при сохранении прогресса: {e}")
+
+
+async def extract_object_details(page, obj_id, on_partial=None):
+    """Извлекает детальную информацию об объекте со страницы"""
+    url = f'https://наш.дом.рф/сервисы/каталог-новостроек/объект/{obj_id}'
+    print(f"Переходим на страницу объекта: {url}")
+
+    details = {}
+
+    try:
+        # Переходим на страницу объекта
+        await page.goto(url, {'timeout': 30000})
+        print("Страница загружена, ожидаем появления элементов...")
+
+        # Ждем загрузки основных элементов
+        await asyncio.sleep(5)
+        
+        # Проверяем капчу
+        try:
+            captcha_detected = await page.evaluate('''() => {
+                return document.body.innerText.includes("Нам очень жаль, но запросы с вашего устройства похожи на автоматические");
+            }''')
+            
+            if captcha_detected:
+                print("🚫 Обнаружена капча!")
+                return "CAPTCHA_DETECTED"
+        except Exception as captcha_error:
+            print(f"Ошибка при проверке капчи: {captcha_error}")
+
+        # Извлекаем основные характеристики через JavaScript
+        characteristics = await page.evaluate('''() => {
+            const result = {
+                'main_characteristics': {},
+                'yard_improvement': {},
+                'parking_space': {},
+                'accessible_environment': {},
+                'elevators': {},
+                'energy_efficiency': '',
+                'contractors': ''
+            };
+
+            // Функция для поиска значения рядом с лейблом
+            function findValueByLabel(labelText, section = 'main_characteristics') {
+                const spans = document.querySelectorAll('span');
+                for (const span of spans) {
+                    const text = span.innerText || '';
+                    if (text.includes(labelText)) {
+                        // Ищем следующий элемент с числом или значением
+                        const parent = span.parentElement;
+                        if (parent) {
+                            const siblings = Array.from(parent.children);
+                            const currentIndex = siblings.indexOf(span);
+
+                            // Ищем следующий элемент с значением
+                            for (let i = currentIndex + 1; i < siblings.length; i++) {
+                                const sibling = siblings[i];
+                                const siblingText = sibling.innerText || '';
+
+                                // Пропускаем пустые элементы и элементы с только пробелами
+                                if (siblingText.trim() && siblingText.trim() !== ',') {
+                                    // Для числовых полей проверяем, что это число
+                                    if (labelText.includes('Количество') || labelText.includes('площадь') || labelText.includes('потолков')) {
+                                        if (/^[0-9\\s,.,]+$/.test(siblingText.trim())) {
+                                            return siblingText.trim();
+                                        }
+                                    } else {
+                                        // Для текстовых полей берем любое непустое значение
+                                        return siblingText.trim();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                return null;
+            }
+
+            // Извлекаем основные характеристики
+            const mainFields = [
+                'Класс недвижимости',
+                'Материал стен', 
+                'Тип отделки',
+                'Свободная планировка',
+                'Количество этажей',
+                'Количество квартир',
+                'Жилая площадь',
+                'Высота потолков'
+            ];
+
+            for (const field of mainFields) {
+                const value = findValueByLabel(field);
+                if (value) {
+                    result.main_characteristics[field] = value;
+                }
+            }
+
+            // Извлекаем благоустройство двора
+            const yardFields = [
+                'Велосипедные дорожки',
+                'Количество детских площадок',
+                'Количество спортивных площадок',
+                'Количество площадок для сбора мусора'
+            ];
+
+            for (const field of yardFields) {
+                const value = findValueByLabel(field);
+                if (value) {
+                    result.yard_improvement[field] = value;
+                }
+            }
+
+            // Извлекаем парковочное пространство
+            const parkingFields = [
+                'Количество мест в паркинге',
+                'Гостевые места на придомовой территории',
+                'Гостевые места вне придомовой территории'
+            ];
+
+            for (const field of parkingFields) {
+                const value = findValueByLabel(field);
+                if (value) {
+                    result.parking_space[field] = value;
+                }
+            }
+
+            // Извлекаем безбарьерную среду
+            const accessibleFields = [
+                'Наличие пандуса',
+                'Наличие понижающих площадок',
+                'Количество инвалидных подъемников'
+            ];
+
+            for (const field of accessibleFields) {
+                const value = findValueByLabel(field);
+                if (value) {
+                    result.accessible_environment[field] = value;
+                }
+            }
+
+            // Извлекаем лифты
+            const elevatorFields = [
+                'Количество подъездов',
+                'Количество пассажирских лифтов',
+                'Количество грузовых и грузопассажирских лифтов'
+            ];
+
+            for (const field of elevatorFields) {
+                const value = findValueByLabel(field);
+                if (value) {
+                    result.elevators[field] = value;
+                }
+            }
+
+            // Извлекаем общую информацию
+            try {
+                const pageText = document.body.innerText;
+                
+                // Класс энергоэффективности
+                const energyMatch = pageText.match(/Класс энергоэффективности здания:\\s*([A-Z])/);
+                if (energyMatch) {
+                    result.energy_efficiency = energyMatch[1];
+                }
+                
+                // Генподрядчики
+                const contractorMatch = pageText.match(/Генподрядчики:\\s*([^\\n]+)/);
+                if (contractorMatch) {
+                    result.contractors = contractorMatch[1];
+                }
+            } catch (e) {
+                console.log('Ошибка при извлечении общей информации:', e);
+            }
+            
+
+            return result;
+        }''')
+
+        details.update(characteristics)
+        print(f"Извлечены характеристики для объекта {obj_id}")
+        # Сохраняем частичный результат после извлечения характеристик
+        if callable(on_partial):
+            try:
+                on_partial(details)
+            except Exception as cb_err:
+                print(f"Ошибка при промежуточном сохранении (характеристики): {cb_err}")
+        
+        # Получаем данные о квартирах через отдельные API запросы с пагинацией
+        flat_types = ['oneRoom', 'twoRoom', 'threeRoom', 'fourRoom']
+        flats_data = {}
+        
+        for flat_type in flat_types:
+            try:
+                print(f"🏠 Получаем ВСЕ квартиры типа {flat_type} для объекта {obj_id}")
+                flats_result = await get_all_flats_for_type(page, obj_id, flat_type)
+                
+                if flats_result['total_count'] > 0:
+                    flats_data[flat_type] = {
+                        'flats': flats_result['flats'],
+                        'total_count': flats_result['total_count']
+                    }
+                    print(f"✅ Получено {flats_result['total_count']} квартир типа {flat_type}")
+                else:
+                    if flats_result.get('consecutive_errors', 0) >= 3:
+                        print(f"⚠️  Квартир типа {flat_type} не найдено (превышено количество ошибок)")
+                    else:
+                        print(f"ℹ️  Квартир типа {flat_type} не найдено")
+
+                # Промежуточное сохранение после каждого типа квартир
+                if callable(on_partial):
+                    try:
+                        details_partial = dict(details)
+                        if flats_data:
+                            details_partial['flats_data'] = dict(flats_data)
+                        on_partial(details_partial)
+                    except Exception as cb_err:
+                        print(f"Ошибка при промежуточном сохранении (квартиры {flat_type}): {cb_err}")
+                    
+                # Пауза между запросами разных типов квартир
+                if flat_type != 'fourRoom':  # Не делаем паузу после последнего типа
+                    await asyncio.sleep(1)
+                
+            except Exception as e:
+                print(f"❌ Критическая ошибка при получении данных о {flat_type} квартирах: {e}")
+        
+        # Добавляем данные о квартирах к общим данным
+        if flats_data:
+            details['flats_data'] = flats_data
+            total_flats = sum(data['total_count'] for data in flats_data.values())
+            print(f"✅ Всего получено {total_flats} квартир для объекта {obj_id}")
+        else:
+            print(f"ℹ️  Квартир не найдено для объекта {obj_id}")
+        
+        # Получаем данные о ходе строительства и фотографиях
+        print(f"🏗️  Извлекаем данные о ходе строительства для объекта {obj_id}")
+        construction_data = await extract_construction_progress(page)
+        
+        if construction_data['construction_stages']:
+            details['construction_progress'] = construction_data
+            print(f"✅ Найдено {len(construction_data['construction_stages'])} этапов строительства")
+            if construction_data['photos']:
+                print(f"📸 Найдено {len(construction_data['photos'])} фотографий")
+        else:
+            print(f"ℹ️  Данные о ходе строительства не найдены для объекта {obj_id}")
+
+        # Промежуточное сохранение после хода строительства
+        if callable(on_partial):
+            try:
+                on_partial(details)
+            except Exception as cb_err:
+                print(f"Ошибка при промежуточном сохранении (ход строительства): {cb_err}")
+        
+    except Exception as e:
+        error_message = str(e)
+        print(f"Ошибка при извлечении данных объекта {obj_id}: {e}")
+        
+        # Проверяем, является ли это ошибкой прокси
+        if "ERR_PROXY_CONNECTION_FAILED" in error_message or "PROXY" in error_message:
+            print("🔌 Обнаружена ошибка подключения к прокси!")
+            return "PROXY_ERROR"
+        
+        return None
+    
+    return details
+
+
+async def process_objects():
+    """Основная функция обработки объектов"""
+    # Загружаем JSON файл с объектами
+    if not os.path.exists(INPUT_JSON):
+        print(f"Файл {INPUT_JSON} не найден!")
+        return
+
+    try:
+        collection = get_collection()
+        with open(INPUT_JSON, 'r', encoding='utf-8') as f:
+            objects = json.load(f)
+        print(f"Загружено {len(objects)} объектов из JSON файла")
+    except Exception as e:
+        print(f"Ошибка при загрузке JSON файла: {e}")
+        return
+
+    # Загружаем прогресс
+    progress = load_progress()
+    processed_ids = set(progress.get('processed_ids', []))
+    failed_ids = set(progress.get('failed_ids', []))
+
+    # Получаем список объектов для обработки
+    objects_to_process = []
+    for obj in objects:
+        obj_id = obj.get('objId')
+        if obj_id and obj_id not in processed_ids and obj_id not in failed_ids:
+            objects_to_process.append(obj)
+
+    print(f"Найдено {len(objects_to_process)} объектов для обработки")
+
+    if not objects_to_process:
+        print("Все объекты уже обработаны")
+        return
+
+    # Создаем браузер один раз для всех объектов
+    browser = None
+    page = None
+    error_count = 0
+    
+    try:
+        # Создаем браузер с антидетект-настройками (прокси настроено в open_browser.py)
+        browser, page = await setup_stealth_browser()
+        print("Браузер создан с антидетект-настройками")
+
+        # Обрабатываем объекты
+        for i, obj in enumerate(objects_to_process):
+            obj_id = obj.get('objId')
+            print(f"\\n🔄 Обрабатываем объект {i + 1}/{len(objects_to_process)} (ID: {obj_id})")
+
+            try:
+                # Колбэк для промежуточного сохранения текущего объекта
+                def on_partial_save(details_partial):
+                    obj_copy = obj.copy()
+                    obj_copy['object_details'] = details_partial
+                    obj_copy['details_extracted_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
+                    try:
+                        upsert_object_smart(collection, obj_id, obj_copy)
+                    except Exception as inner_err:
+                        print(f"Ошибка при промежуточном сохранении в MongoDB: {inner_err}")
+
+                # Извлекаем детали объекта с промежуточными сохранениями
+                details = await extract_object_details(page, obj_id, on_partial=on_partial_save)
+
+                if details == "PROXY_ERROR":
+                    print(f"🔌 Ошибка прокси для объекта {obj_id}! Перезапускаем браузер с новым прокси...")
+                    error_count += 1
+                    
+                    # Перезапускаем браузер при ошибке прокси
+                    try:
+                        await browser.close()
+                    except:
+                        pass
+                    await asyncio.sleep(2)
+                    browser, page = await setup_stealth_browser()
+                    print("🔄 Браузер перезапущен с новым прокси")
+                    continue
+                elif details == "CAPTCHA_DETECTED":
+                    print(f"🚫 Обнаружена капча для объекта {obj_id}! Перезапускаем браузер...")
+                    error_count += 1
+                    
+                    # Перезапускаем браузер при капче
+                    try:
+                        await browser.close()
+                    except:
+                        pass
+                    await asyncio.sleep(3)
+                    browser, page = await setup_stealth_browser()
+                    print("Браузер перезапущен")
+                    continue
+                elif details:
+                    # Добавляем детали к объекту
+                    obj_copy = obj.copy()
+                    obj_copy['object_details'] = details
+                    obj_copy['details_extracted_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
+
+                    # Обновляем запись в MongoDB используя умное сохранение
+                    try:
+                        if upsert_object_smart(collection, obj_id, obj_copy):
+                            print(f"✅ Данные объекта {obj_id} сохранены в MongoDB (коллекция avito)")
+                            processed_ids.add(obj_id)
+                            
+                            # Сохраняем прогресс после каждого успешного объекта
+                            save_progress(processed_ids, failed_ids)
+                            
+                            # Сбрасываем счетчик ошибок при успехе
+                            error_count = 0
+                        else:
+                            print(f"❌ Не удалось сохранить данные объекта {obj_id}")
+                            error_count += 1
+
+                    except Exception as e:
+                        print(f"❌ Ошибка при сохранении в MongoDB: {e}")
+                        error_count += 1
+                else:
+                    print(f"❌ Не удалось извлечь данные для объекта {obj_id}")
+                    error_count += 1
+
+            except Exception as e:
+                error_message = str(e)
+                print(f"Ошибка при работе с объектом {obj_id}: {e}")
+                
+                # Проверяем, является ли это ошибкой прокси
+                if "ERR_PROXY_CONNECTION_FAILED" in error_message or "PROXY" in error_message:
+                    print(f"🔌 Обнаружена ошибка прокси! Перезапускаем браузер...")
+                    try:
+                        await browser.close()
+                    except:
+                        pass
+                    await asyncio.sleep(2)
+                    browser, page = await setup_stealth_browser()
+                    print("🔄 Браузер перезапущен с новым прокси")
+                
+                error_count += 1
+
+            # Перезапускаем браузер при накоплении ошибок
+            if error_count >= 10:
+                print(f"🚨 Накоплено {error_count} ошибок, перезапускаем браузер...")
+                try:
+                    await browser.close()
+                except:
+                    pass
+                await asyncio.sleep(3)
+                browser, page = await setup_stealth_browser()
+                print("Браузер перезапущен из-за накопления ошибок")
+                error_count = 0
+
+            # Пауза между объектами
+            await asyncio.sleep(random.uniform(2, 5))
+
+    except Exception as e:
+        print(f"Критическая ошибка: {e}")
+        if browser:
+            try:
+                await browser.close()
+            except:
+                pass
+
+    # Финальное сохранение прогресса
+    save_progress(list(processed_ids), list(failed_ids))
+
+    print(f"\\n✅ Обработка завершена!")
+    print(f"Успешно обработано: {len(processed_ids)}")
+    print(f"Ошибок: {len(failed_ids)}")
+    print(f"Всего в JSON файле: {len(objects)} объектов")
+
+
+def main():
+    """Главная функция"""
+    print("🚀 Запуск скрипта извлечения деталей объектов...")
+    asyncio.get_event_loop().run_until_complete(process_objects())
+
+
+if __name__ == '__main__':
+    main()

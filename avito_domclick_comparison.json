@@ -1,0 +1,257 @@
+{
+  "statistics": {
+    "total_avito_records": 60,
+    "processed_records": 60,
+    "skipped_records": 0,
+    "matched_records": 41,
+    "match_percentage": 68.33333333333333
+  },
+  "matches": [
+    {
+      "avito_name": "ЖК «8 NEBO»",
+      "domclick_name": "ЖК 8 NEBO",
+      "avito_id": "68e506476e69cd78359abedf",
+      "domclick_id": "68e661d125eeb4c75611e38c"
+    },
+    {
+      "avito_name": "ЖК «Никольская collection»",
+      "domclick_name": "ЖК Никольская collection (колекшн)",
+      "avito_id": "68e506736e69cd78359abee3",
+      "domclick_id": "68e660f925eeb4c75611e380"
+    },
+    {
+      "avito_name": "ЖК «Сапфир»",
+      "domclick_name": "ЖК Сапфир",
+      "avito_id": "68e5068b6e69cd78359abee5",
+      "domclick_id": "68e6599425eeb4c75611e356"
+    },
+    {
+      "avito_name": "ЖК «Эльбрус»",
+      "domclick_name": "ЖК Эльбрус",
+      "avito_id": "68e506a16e69cd78359abee7",
+      "domclick_id": "68e6611125eeb4c75611e382"
+    },
+    {
+      "avito_name": "ЖК «Le CRISTAL»",
+      "domclick_name": "ЖК \"Le CRISTAL\" (Ле Кристал)",
+      "avito_id": "68e506b66e69cd78359abee9",
+      "domclick_id": "68e659be25eeb4c75611e358"
+    },
+    {
+      "avito_name": "ЖК «Сириус»",
+      "domclick_name": "ЖК СИРИУС",
+      "avito_id": "68e506c96e69cd78359abeeb",
+      "domclick_id": "68e6614825eeb4c75611e386"
+    },
+    {
+      "avito_name": "ЖК «Пьермонт»",
+      "domclick_name": "ЖК Пьермонт",
+      "avito_id": "68e506ed6e69cd78359abeef",
+      "domclick_id": "68e663aa25eeb4c75611e39e"
+    },
+    {
+      "avito_name": "ЖК «Космос»",
+      "domclick_name": "ЖК Космос",
+      "avito_id": "68e506fe6e69cd78359abef1",
+      "domclick_id": "68e6600b25eeb4c75611e376"
+    },
+    {
+      "avito_name": "ЖК «Grand&Grand»",
+      "domclick_name": "ЖК \"Grand&Grand (Гранд&Гранд)\"",
+      "avito_id": "68e507336e69cd78359abef5",
+      "domclick_id": "68e6543a1ec83253111c9cae"
+    },
+    {
+      "avito_name": "ЖК «Новый Инорс»",
+      "domclick_name": "ЖК НОВЫЙ ИНОРС",
+      "avito_id": "68e507566e69cd78359abef9",
+      "domclick_id": "68e652961ec83253111c9c9c"
+    },
+    {
+      "avito_name": "Квартал «Самоцветы»",
+      "domclick_name": "ЖК Квартал Самоцветы",
+      "avito_id": "68e507676e69cd78359abefb",
+      "domclick_id": "68e6542c1ec83253111c9cac"
+    },
+    {
+      "avito_name": "ЖК «Greenwich»",
+      "domclick_name": "ЖК \"Greenwich\" (Гринвич)",
+      "avito_id": "68e5079d6e69cd78359abf01",
+      "domclick_id": "68e657cf25eeb4c75611e348"
+    },
+    {
+      "avito_name": "Экогород «Яркий»",
+      "domclick_name": "ЖК Экогород \"Яркий\"",
+      "avito_id": "68e507b06e69cd78359abf03",
+      "domclick_id": "68e6640525eeb4c75611e3a4"
+    },
+    {
+      "avito_name": "Комплекс высотных домов «Грани»",
+      "domclick_name": "ЖК Грани",
+      "avito_id": "68e507c36e69cd78359abf05",
+      "domclick_id": "68e6598725eeb4c75611e354"
+    },
+    {
+      "avito_name": "ЖК «Волна»",
+      "domclick_name": "ЖК Волна",
+      "avito_id": "68e507e56e69cd78359abf07",
+      "domclick_id": "68e6603825eeb4c75611e378"
+    },
+    {
+      "avito_name": "ЖК «Ленинские высотки»",
+      "domclick_name": "ЖК Ленинские высотки",
+      "avito_id": "68e508286e69cd78359abf0b",
+      "domclick_id": "68e663c125eeb4c75611e3a0"
+    },
+    {
+      "avito_name": "ЖК «Atlantis»",
+      "domclick_name": "ЖК Atlantis (Атлантис)",
+      "avito_id": "68e508906e69cd78359abf0f",
+      "domclick_id": "68e6618d25eeb4c75611e38a"
+    },
+    {
+      "avito_name": "Комплекс апартаментов EGO",
+      "domclick_name": "Ego (Эго)",
+      "avito_id": "68e508b06e69cd78359abf11",
+      "domclick_id": "68e6629325eeb4c75611e396"
+    },
+    {
+      "avito_name": "ЖК «8 марта»",
+      "domclick_name": "ЖК 8 МАРТА",
+      "avito_id": "68e508d26e69cd78359abf13",
+      "domclick_id": "68e651ea499501b540ea3f9c"
+    },
+    {
+      "avito_name": "ЖК «NOVALAND» (Литер 10)",
+      "domclick_name": "ЖК NOVALAND (Новалэнд)",
+      "avito_id": "68e509146e69cd78359abf17",
+      "domclick_id": "68e653f31ec83253111c9ca8"
+    },
+    {
+      "avito_name": "Комплекс апартаментов «Каретная 51»",
+      "domclick_name": "Каретная 51",
+      "avito_id": "68e509dd6e69cd78359abf1b",
+      "domclick_id": "68e65fd025eeb4c75611e374"
+    },
+    {
+      "avito_name": "ЖК «Аксаковский»",
+      "domclick_name": "ЖК \"Аксаковский\"",
+      "avito_id": "68e509f36e69cd78359abf1d",
+      "domclick_id": "68e664a625eeb4c75611e3a8"
+    },
+    {
+      "avito_name": "ЖК «Акварель»",
+      "domclick_name": "ЖК АКВАРЕЛЬ",
+      "avito_id": "68e50a256e69cd78359abf21",
+      "domclick_id": "68e652e21ec83253111c9c9e"
+    },
+    {
+      "avito_name": "Красочный квартал «Цвет»",
+      "domclick_name": "ЖК Красочный квартал Цвет",
+      "avito_id": "68e50a396e69cd78359abf23",
+      "domclick_id": "68e6613425eeb4c75611e384"
+    },
+    {
+      "avito_name": "ЖК «Цветы Башкирии»",
+      "domclick_name": "ЖК Цветы Башкирии",
+      "avito_id": "68e50a576e69cd78359abf25",
+      "domclick_id": "68e6526c1ec83253111c9c98"
+    },
+    {
+      "avito_name": "ЖК «Новатор»",
+      "domclick_name": "ЖК \"Новатор\"",
+      "avito_id": "68e50a876e69cd78359abf27",
+      "domclick_id": "68e6549e1ec83253111c9cb4"
+    },
+    {
+      "avito_name": "ЖК «Grand Avenue»",
+      "domclick_name": "ЖК Grand Avenue (Гранд Авеню)",
+      "avito_id": "68e50aa16e69cd78359abf29",
+      "domclick_id": "68e6617625eeb4c75611e388"
+    },
+    {
+      "avito_name": "ЖК «Divo Residence»",
+      "domclick_name": "ЖК \"Divo Residence (Диво Резиденс)\"",
+      "avito_id": "68e50ac56e69cd78359abf2b",
+      "domclick_id": "68e654af1ec83253111c9cb6"
+    },
+    {
+      "avito_name": "ЖК «The SKY»",
+      "domclick_name": "ЖК THE SKY (СКАЙ)",
+      "avito_id": "68e50ae06e69cd78359abf2d",
+      "domclick_id": "68e65db225eeb4c75611e362"
+    },
+    {
+      "avito_name": "ЖК «Новый Умный дом «Гелиос»",
+      "domclick_name": "ЖК Умный дом",
+      "avito_id": "68e50c0a6e69cd78359abf31",
+      "domclick_id": "68e664b925eeb4c75611e3aa"
+    },
+    {
+      "avito_name": "ЖК «The Prime»",
+      "domclick_name": "ЖК THE PRIME",
+      "avito_id": "68e50c5b6e69cd78359abf35",
+      "domclick_id": "68e6597525eeb4c75611e352"
+    },
+    {
+      "avito_name": "ЖК «Новый Фамильный»",
+      "domclick_name": "ЖК Новый Фамильный",
+      "avito_id": "68e50c7b6e69cd78359abf37",
+      "domclick_id": "68e65ec025eeb4c75611e36c"
+    },
+    {
+      "avito_name": "ЖК «Урбан Мартен»",
+      "domclick_name": "ЖК \"Урбан Мартен\"",
+      "avito_id": "68e50c9c6e69cd78359abf39",
+      "domclick_id": "68e6637525eeb4c75611e39c"
+    },
+    {
+      "avito_name": "ЖК «Terle park» (Терле Парк)",
+      "domclick_name": "ЖК Terle park (Терле Парк)",
+      "avito_id": "68e50cee6e69cd78359abf3d",
+      "domclick_id": "68e6595625eeb4c75611e350"
+    },
+    {
+      "avito_name": "ЖК URBANIСA",
+      "domclick_name": "ЖК URBANIСA (Урбаника)",
+      "avito_id": "68e50d556e69cd78359abf41",
+      "domclick_id": "68e6584325eeb4c75611e34c"
+    },
+    {
+      "avito_name": "Комплекс апартаментов «Серп и молот»",
+      "domclick_name": "СЕРП и МОЛОТ",
+      "avito_id": "68e50d776e69cd78359abf43",
+      "domclick_id": "68e6608525eeb4c75611e37c"
+    },
+    {
+      "avito_name": "ЖК «Матур‎»",
+      "domclick_name": "ЖК MATUR (МАТУР)",
+      "avito_id": "68e50dce6e69cd78359abf47",
+      "domclick_id": "68e6606525eeb4c75611e37a"
+    },
+    {
+      "avito_name": "ЖК «Вершина»",
+      "domclick_name": "ЖК Вершина",
+      "avito_id": "68e50dee6e69cd78359abf49",
+      "domclick_id": "68e6623725eeb4c75611e392"
+    },
+    {
+      "avito_name": "ЖК «AURUM»",
+      "domclick_name": "ЖК АУРУМ",
+      "avito_id": "68e5f2a1eb188ee52e691089",
+      "domclick_id": "68e65e7c25eeb4c75611e368"
+    },
+    {
+      "avito_name": "ЖК «Паруса»",
+      "domclick_name": "ЖК Паруса",
+      "avito_id": "68e5f2e1eb188ee52e69108d",
+      "domclick_id": "68e65f1825eeb4c75611e370"
+    },
+    {
+      "avito_name": "Микрорайон «NOVALAND»",
+      "domclick_name": "ЖК NOVALAND (Новалэнд)",
+      "avito_id": "68e5f2fdeb188ee52e69108f",
+      "domclick_id": "68e653f31ec83253111c9ca8"
+    }
+  ]
+}

@@ -20,8 +20,37 @@ MAX_RETRIES = 3
 RETRY_DELAY = 5
 
 
+async def check_ban_status(page):
+    """Проверяет, заблокирован ли доступ к сайту"""
+    return await page.evaluate('''() => {
+        const bodyText = document.body.innerText.toLowerCase();
+        const banMessages = [
+            "нам очень жаль, но запросы с вашего устройства похожи на автоматические",
+            "подтвердите, что вы не робот — потяните ползунок",
+            "потяните ползунок, чтобы развернуть картинку",
+            "запросы похожи на автоматические",
+            "автоматические запросы",
+            "доступ ограничен",
+            "проверка безопасности",
+            "cloudflare",
+            "blocked",
+            "captcha"
+        ];
+        
+        return banMessages.some(msg => bodyText.includes(msg));
+    }''')
+
+
 async def fetch_flats_api_in_browser(page, obj_id, flat_type, limit=100, offset=0):
-    """Выполняет API запрос для получения данных о квартирах"""
+    """Выполняет API запрос для получения данных о квартирах (таймаут: 15 секунд)"""
+    
+    # Проверяем бан перед каждым API запросом
+    ban_detected = await check_ban_status(page)
+    
+    if ban_detected:
+        print(f"🚫 Обнаружен бан при API запросе квартир! Прерываем запрос.")
+        return "BAN_DETECTED"
+    
     api_url = f"https://xn--80az8a.xn--d1aqf.xn--p1ai/portal-kn/api/kn/objects/{obj_id}/flats"
     params = {
         'flatGroupType': flat_type,
@@ -35,6 +64,10 @@ async def fetch_flats_api_in_browser(page, obj_id, flat_type, limit=100, offset=
     js_code = f'''
         async () => {{
             try {{
+                // Создаем AbortController для таймаута
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 15000); // 15 секунд
+                
                 const resp = await fetch("{url}", {{
                     headers: {{
                         'accept': 'application/json, text/plain, */*',
@@ -45,12 +78,20 @@ async def fetch_flats_api_in_browser(page, obj_id, flat_type, limit=100, offset=
                     }},
                     method: 'GET',
                     mode: 'cors',
-                    credentials: 'include'
+                    credentials: 'include',
+                    signal: controller.signal
                 }});
+                
+                clearTimeout(timeoutId); // Очищаем таймаут после успешного запроса
+                
                 if (!resp.ok) return null;
                 return await resp.json();
             }} catch (e) {{
-                console.log('Ошибка при запросе API квартир:', e);
+                if (e.name === 'AbortError') {{
+                    console.log('Таймаут API запроса (15 секунд)');
+                }} else {{
+                    console.log('Ошибка при запросе API квартир:', e);
+                }}
                 return null;
             }}
         }}
@@ -66,16 +107,46 @@ async def get_all_flats_for_type(page, obj_id, flat_type):
     page_num = 1
     consecutive_errors = 0  # Счетчик последовательных ошибок
     max_consecutive_errors = 3  # Максимальное количество последовательных ошибок
-    
+
     while True:
         try:
+            # Проверяем бан перед каждым API запросом
+            ban_detected = await check_ban_status(page)
+            
+            if ban_detected:
+                print(f"  🚫 Обнаружен бан при получении квартир типа {flat_type} (страница {page_num}). Прерываем обработку.")
+                return {
+                    'flats': [],
+                    'total_count': 0,
+                    'consecutive_errors': 999  # Специальный код для бана
+                }
+            
             print(f"  Получаем страницу {page_num} для {flat_type} (offset={offset}, limit={limit})")
             flats_data = await fetch_flats_api_in_browser(page, obj_id, flat_type, limit, offset)
+            
+            # Проверяем бан после API запроса (на случай если бан появился в результате запроса)
+            ban_detected_after = await check_ban_status(page)
+            if ban_detected_after:
+                print(f"  🚫 Обнаружен бан после API запроса квартир типа {flat_type} (страница {page_num}). Прерываем обработку.")
+                return {
+                    'flats': [],
+                    'total_count': 0,
+                    'consecutive_errors': 999  # Специальный код для бана
+                }
+            
+            # Проверяем, обнаружен ли бан
+            if flats_data == "BAN_DETECTED":
+                print(f"  🚫 Обнаружен бан при получении квартир типа {flat_type}. Прерываем обработку.")
+                return {
+                    'flats': [],
+                    'total_count': 0,
+                    'consecutive_errors': 999  # Специальный код для бана
+                }
             
             if not flats_data:
                 consecutive_errors += 1
                 print(f"  ❌ Ошибка или пустой ответ для {flat_type} на offset={offset} (ошибка {consecutive_errors}/{max_consecutive_errors})")
-                
+
                 if consecutive_errors >= max_consecutive_errors:
                     print(f"  🛑 Превышено максимальное количество ошибок ({max_consecutive_errors}) для {flat_type}. Переходим к следующему типу.")
                     break
@@ -85,35 +156,35 @@ async def get_all_flats_for_type(page, obj_id, flat_type):
                     page_num += 1
                     await asyncio.sleep(0.5)  # Увеличенная задержка при ошибке
                     continue
-                
+
             # Если получили данные, сбрасываем счетчик ошибок
             consecutive_errors = 0
-                
+
             # Проверяем структуру ответа
             if 'data' in flats_data and isinstance(flats_data['data'], list):
                 flats = flats_data['data']
                 if not flats:
                     print(f"  ✅ Получены все квартиры типа {flat_type}. Всего: {len(all_flats)}")
                     break
-                    
+
                 all_flats.extend(flats)
                 print(f"  📄 Получено {len(flats)} квартир, всего: {len(all_flats)}")
-                
+
                 # Если получили меньше запрошенного количества, значит это последняя страница
                 if len(flats) < limit:
                     print(f"  ✅ Получены все квартиры типа {flat_type}. Всего: {len(all_flats)}")
                     break
-                    
+
             elif isinstance(flats_data, list):
                 # Если ответ - это просто массив квартир
                 flats = flats_data
                 if not flats:
                     print(f"  ✅ Получены все квартиры типа {flat_type}. Всего: {len(all_flats)}")
                     break
-                    
+
                 all_flats.extend(flats)
                 print(f"  📄 Получено {len(flats)} квартир, всего: {len(all_flats)}")
-                
+
                 # Если получили меньше запрошенного количества, значит это последняя страница
                 if len(flats) < limit:
                     print(f"  ✅ Получены все квартиры типа {flat_type}. Всего: {len(all_flats)}")
@@ -121,7 +192,7 @@ async def get_all_flats_for_type(page, obj_id, flat_type):
             else:
                 consecutive_errors += 1
                 print(f"  ❌ Неожиданная структура ответа для {flat_type} (ошибка {consecutive_errors}/{max_consecutive_errors})")
-                
+
                 if consecutive_errors >= max_consecutive_errors:
                     print(f"  🛑 Превышено максимальное количество ошибок ({max_consecutive_errors}) для {flat_type}. Переходим к следующему типу.")
                     break
@@ -130,18 +201,18 @@ async def get_all_flats_for_type(page, obj_id, flat_type):
                     page_num += 1
                     await asyncio.sleep(0.5)
                     continue
-            
+
             # Переходим к следующей странице
             offset += limit
             page_num += 1
-            
+
             # Небольшая задержка между запросами
             await asyncio.sleep(0.2)
-            
+
         except Exception as e:
             consecutive_errors += 1
             print(f"  ❌ Ошибка при получении страницы {page_num} для {flat_type}: {e} (ошибка {consecutive_errors}/{max_consecutive_errors})")
-            
+
             if consecutive_errors >= max_consecutive_errors:
                 print(f"  🛑 Превышено максимальное количество ошибок ({max_consecutive_errors}) для {flat_type}. Переходим к следующему типу.")
                 break
@@ -150,7 +221,7 @@ async def get_all_flats_for_type(page, obj_id, flat_type):
                 offset += limit
                 page_num += 1
                 await asyncio.sleep(0.5)  # Увеличенная задержка при ошибке
-    
+
     return {
         'flats': all_flats,
         'total_count': len(all_flats),
@@ -290,9 +361,9 @@ async def extract_construction_progress(page):
             
             return result;
         }''')
-        
+
         return construction_data
-        
+
     except Exception as e:
         print(f"Ошибка при извлечении данных о ходе строительства: {e}")
         return {
@@ -342,21 +413,40 @@ async def extract_object_details(page, obj_id, on_partial=None):
         # Переходим на страницу объекта
         await page.goto(url, {'timeout': 30000})
         print("Страница загружена, ожидаем появления элементов...")
+        
+        # Проверяем бан сразу после загрузки страницы
+        ban_detected = await check_ban_status(page)
+        
+        if ban_detected:
+            print(f"🚫 Обнаружен бан сразу после загрузки страницы объекта {obj_id}! Прерываем обработку.")
+            return "BAN_DETECTED"
 
         # Ждем загрузки основных элементов
         await asyncio.sleep(5)
-        
-        # Проверяем капчу
+
+        # Проверяем бан/капчу
         try:
-            captcha_detected = await page.evaluate('''() => {
-                return document.body.innerText.includes("Нам очень жаль, но запросы с вашего устройства похожи на автоматические");
+            ban_detected = await page.evaluate('''() => {
+                const bodyText = document.body.innerText.toLowerCase();
+                const banMessages = [
+                    "нам очень жаль, но запросы с вашего устройства похожи на автоматические",
+                    "запросы похожи на автоматические",
+                    "автоматические запросы",
+                    "доступ ограничен",
+                    "проверка безопасности",
+                    "cloudflare",
+                    "blocked",
+                    "captcha"
+                ];
+                
+                return banMessages.some(msg => bodyText.includes(msg));
             }''')
             
-            if captcha_detected:
-                print("🚫 Обнаружена капча!")
-                return "CAPTCHA_DETECTED"
-        except Exception as captcha_error:
-            print(f"Ошибка при проверке капчи: {captcha_error}")
+            if ban_detected:
+                print("🚫 Обнаружен бан или капча!")
+                return "BAN_DETECTED"
+        except Exception as ban_error:
+            print(f"Ошибка при проверке бана: {ban_error}")
 
         # Извлекаем основные характеристики через JavaScript
         characteristics = await page.evaluate('''() => {
@@ -513,15 +603,27 @@ async def extract_object_details(page, obj_id, on_partial=None):
                 on_partial(details)
             except Exception as cb_err:
                 print(f"Ошибка при промежуточном сохранении (характеристики): {cb_err}")
-        
+
         # Получаем данные о квартирах через отдельные API запросы с пагинацией
         flat_types = ['oneRoom', 'twoRoom', 'threeRoom', 'fourRoom']
         flats_data = {}
         
         for flat_type in flat_types:
             try:
+                # Проверяем бан перед обработкой каждого типа квартир
+                ban_detected = await check_ban_status(page)
+                
+                if ban_detected:
+                    print(f"🚫 Обнаружен бан перед обработкой квартир типа {flat_type}! Прерываем обработку объекта {obj_id}")
+                    return "BAN_DETECTED"
+                
                 print(f"🏠 Получаем ВСЕ квартиры типа {flat_type} для объекта {obj_id}")
                 flats_result = await get_all_flats_for_type(page, obj_id, flat_type)
+                
+                # Проверяем, был ли обнаружен бан
+                if flats_result.get('consecutive_errors') == 999:
+                    print(f"🚫 Обнаружен бан при получении квартир! Прерываем обработку объекта {obj_id}")
+                    return "BAN_DETECTED"
                 
                 if flats_result['total_count'] > 0:
                     flats_data[flat_type] = {
@@ -535,6 +637,12 @@ async def extract_object_details(page, obj_id, on_partial=None):
                     else:
                         print(f"ℹ️  Квартир типа {flat_type} не найдено")
 
+                # Проверяем бан после обработки каждого типа квартир
+                ban_detected_after_type = await check_ban_status(page)
+                if ban_detected_after_type:
+                    print(f"🚫 Обнаружен бан после обработки квартир типа {flat_type}! Прерываем обработку объекта {obj_id}")
+                    return "BAN_DETECTED"
+
                 # Промежуточное сохранение после каждого типа квартир
                 if callable(on_partial):
                     try:
@@ -544,14 +652,14 @@ async def extract_object_details(page, obj_id, on_partial=None):
                         on_partial(details_partial)
                     except Exception as cb_err:
                         print(f"Ошибка при промежуточном сохранении (квартиры {flat_type}): {cb_err}")
-                    
+
                 # Пауза между запросами разных типов квартир
                 if flat_type != 'fourRoom':  # Не делаем паузу после последнего типа
                     await asyncio.sleep(1)
-                
+
             except Exception as e:
                 print(f"❌ Критическая ошибка при получении данных о {flat_type} квартирах: {e}")
-        
+
         # Добавляем данные о квартирах к общим данным
         if flats_data:
             details['flats_data'] = flats_data
@@ -559,11 +667,11 @@ async def extract_object_details(page, obj_id, on_partial=None):
             print(f"✅ Всего получено {total_flats} квартир для объекта {obj_id}")
         else:
             print(f"ℹ️  Квартир не найдено для объекта {obj_id}")
-        
+
         # Получаем данные о ходе строительства и фотографиях
         print(f"🏗️  Извлекаем данные о ходе строительства для объекта {obj_id}")
         construction_data = await extract_construction_progress(page)
-        
+
         if construction_data['construction_stages']:
             details['construction_progress'] = construction_data
             print(f"✅ Найдено {len(construction_data['construction_stages'])} этапов строительства")
@@ -578,18 +686,18 @@ async def extract_object_details(page, obj_id, on_partial=None):
                 on_partial(details)
             except Exception as cb_err:
                 print(f"Ошибка при промежуточном сохранении (ход строительства): {cb_err}")
-        
+
     except Exception as e:
         error_message = str(e)
         print(f"Ошибка при извлечении данных объекта {obj_id}: {e}")
-        
+
         # Проверяем, является ли это ошибкой прокси
         if "ERR_PROXY_CONNECTION_FAILED" in error_message or "PROXY" in error_message:
             print("🔌 Обнаружена ошибка подключения к прокси!")
             return "PROXY_ERROR"
-        
+
         return None
-    
+
     return details
 
 
@@ -631,7 +739,7 @@ async def process_objects():
     browser = None
     page = None
     error_count = 0
-    
+
     try:
         # Создаем браузер с антидетект-настройками (прокси настроено в open_browser.py)
         browser, page = await setup_stealth_browser()
@@ -659,7 +767,7 @@ async def process_objects():
                 if details == "PROXY_ERROR":
                     print(f"🔌 Ошибка прокси для объекта {obj_id}! Перезапускаем браузер с новым прокси...")
                     error_count += 1
-                    
+
                     # Перезапускаем браузер при ошибке прокси
                     try:
                         await browser.close()
@@ -669,18 +777,18 @@ async def process_objects():
                     browser, page = await setup_stealth_browser()
                     print("🔄 Браузер перезапущен с новым прокси")
                     continue
-                elif details == "CAPTCHA_DETECTED":
-                    print(f"🚫 Обнаружена капча для объекта {obj_id}! Перезапускаем браузер...")
+                elif details == "BAN_DETECTED":
+                    print(f"🚫 Обнаружен бан/капча для объекта {obj_id}! Перезапускаем браузер...")
                     error_count += 1
                     
-                    # Перезапускаем браузер при капче
+                    # Перезапускаем браузер при бане/капче
                     try:
                         await browser.close()
                     except:
                         pass
-                    await asyncio.sleep(3)
+                    await asyncio.sleep(5)  # Увеличиваем задержку при бане
                     browser, page = await setup_stealth_browser()
-                    print("Браузер перезапущен")
+                    print("🔄 Браузер перезапущен после обнаружения бана")
                     continue
                 elif details:
                     # Добавляем детали к объекту
@@ -691,12 +799,12 @@ async def process_objects():
                     # Обновляем запись в MongoDB используя умное сохранение
                     try:
                         if upsert_object_smart(collection, obj_id, obj_copy):
-                            print(f"✅ Данные объекта {obj_id} сохранены в MongoDB (коллекция avito)")
+                            print(f"✅ Данные объекта {obj_id} сохранены в MongoDB (коллекция domrf)")
                             processed_ids.add(obj_id)
-                            
+
                             # Сохраняем прогресс после каждого успешного объекта
                             save_progress(processed_ids, failed_ids)
-                            
+
                             # Сбрасываем счетчик ошибок при успехе
                             error_count = 0
                         else:
@@ -713,7 +821,7 @@ async def process_objects():
             except Exception as e:
                 error_message = str(e)
                 print(f"Ошибка при работе с объектом {obj_id}: {e}")
-                
+
                 # Проверяем, является ли это ошибкой прокси
                 if "ERR_PROXY_CONNECTION_FAILED" in error_message or "PROXY" in error_message:
                     print(f"🔌 Обнаружена ошибка прокси! Перезапускаем браузер...")
@@ -724,7 +832,7 @@ async def process_objects():
                     await asyncio.sleep(2)
                     browser, page = await setup_stealth_browser()
                     print("🔄 Браузер перезапущен с новым прокси")
-                
+
                 error_count += 1
 
             # Перезапускаем браузер при накоплении ошибок

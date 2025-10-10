@@ -244,7 +244,7 @@ def calculate_similarity(name1: str, name2: str) -> float:
     return 0.0
 
 
-def find_matching_domclick_record(avito_name: str, domclick_collection) -> Optional[Dict]:
+def find_matching_domclick_record(avito_name: str, domclick_collection, used_domclick_ids: set) -> Optional[Dict]:
     """Ищет запись в DomClick по названию ЖК из Avito"""
     if not avito_name:
         return None
@@ -253,8 +253,8 @@ def find_matching_domclick_record(avito_name: str, domclick_collection) -> Optio
     normalized_avito = normalize_name(avito_name)
     print(f"🔍 Avito: '{avito_name}' → нормализовано: '{normalized_avito}'")
     
-    # Получаем все записи из DomClick
-    domclick_records = list(domclick_collection.find())
+    # Получаем все записи из DomClick, исключая уже использованные
+    domclick_records = list(domclick_collection.find({'_id': {'$nin': list(used_domclick_ids)}}))
     
     best_match = None
     best_score = 0
@@ -334,6 +334,9 @@ def compare_avito_domclick():
         total_matched = 0
         total_skipped = 0
         matches_details = []
+        unmatched_avito = []
+        unmatched_domclick = []
+        used_domclick_ids = set()
         
         print(f"\n🔄 ОБРАБОТКА ЗАПИСЕЙ:")
         print("="*80)
@@ -350,13 +353,16 @@ def compare_avito_domclick():
                 total_skipped += 1
                 continue
             
-            # Ищем совпадения в DomClick
-            domclick_match = find_matching_domclick_record(avito_name, domclick_collection)
+            # Ищем совпадения в DomClick (исключая уже использованные)
+            domclick_match = find_matching_domclick_record(avito_name, domclick_collection, used_domclick_ids)
             
             total_processed += 1
             
             if domclick_match:
                 total_matched += 1
+                # Добавляем в список использованных
+                used_domclick_ids.add(domclick_match['_id'])
+                
                 domclick_development = domclick_match.get('development', {})
                 domclick_name = domclick_development.get('complex_name', '')
                 
@@ -367,13 +373,35 @@ def compare_avito_domclick():
                     'domclick_id': str(domclick_match.get('_id'))
                 }
                 matches_details.append(match_info)
+            else:
+                # Добавляем в список несопоставленных Avito
+                unmatched_avito.append({
+                    'name': avito_name,
+                    'id': str(avito_record.get('_id')),
+                    'reason': 'Не найдено в DomClick'
+                })
+        
+        # Собираем несопоставленные записи DomClick
+        print(f"\n📋 Собираем несопоставленные записи DomClick...")
+        domclick_records = list(domclick_collection.find())
+        for record in domclick_records:
+            if record['_id'] not in used_domclick_ids:
+                development = record.get('development', {})
+                domclick_name = development.get('complex_name', '')
+                if domclick_name:
+                    unmatched_domclick.append({
+                        'name': domclick_name,
+                        'id': str(record.get('_id')),
+                        'reason': 'Не найдено в Avito'
+                    })
         
         # Выводим итоговую статистику
         print(f"\n{'='*80}")
         print("📈 ИТОГОВАЯ СТАТИСТИКА:")
         print("="*80)
         print(f"  • Всего записей в Avito: {len(avito_records)}")
-        print(f"  • Обработано записей: {total_processed}")
+        print(f"  • Всего записей в DomClick: {len(domclick_records)}")
+        print(f"  • Обработано записей Avito: {total_processed}")
         print(f"  • Пропущено (нет названия): {total_skipped}")
         print(f"  • Найдено совпадений: {total_matched}")
         print(f"  • Процент совпадений: {(total_matched/total_processed*100):.1f}%" if total_processed > 0 else "  • Процент совпадений: 0.0%")
@@ -390,6 +418,27 @@ def compare_avito_domclick():
             
             if len(matches_details) > 10:
                 print(f"    ... и ещё {len(matches_details) - 10} совпадений")
+        
+        # Выводим таблицы несопоставленных записей
+        if unmatched_avito:
+            print(f"\n📋 НЕСОПОСТАВЛЕННЫЕ ЗАПИСИ ИЗ AVITO ({len(unmatched_avito)} шт.)")
+            print("=" * 80)
+            print(f"{'№':<4} {'Название ЖК':<60} {'ID':<20} {'Причина'}")
+            print("-" * 80)
+            for i, record in enumerate(unmatched_avito, 1):
+                name = record['name']
+                name = name[:58] if name and len(name) > 58 else name
+                print(f"{i:<4} {name:<60} {record['id'][:18]:<20} {record['reason']}")
+        
+        if unmatched_domclick:
+            print(f"\n📋 НЕСОПОСТАВЛЕННЫЕ ЗАПИСИ ИЗ DOMCLICK ({len(unmatched_domclick)} шт.)")
+            print("=" * 80)
+            print(f"{'№':<4} {'Название ЖК':<60} {'ID':<20} {'Причина'}")
+            print("-" * 80)
+            for i, record in enumerate(unmatched_domclick, 1):
+                name = record['name']
+                name = name[:58] if name and len(name) > 58 else name
+                print(f"{i:<4} {name:<60} {record['id'][:18]:<20} {record['reason']}")
         
         # Сохраняем результаты в файл
         results_file = PROJECT_ROOT / "avito_domclick_comparison.json"

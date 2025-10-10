@@ -164,6 +164,42 @@ def compare_and_merge_data(existing_data: Dict[str, Any], new_data: Dict[str, An
     return merged
 
 
+def check_duplicate_by_name(collection, obj_id: str, obj_commerc_nm: str) -> bool:
+    """
+    Проверяет, есть ли уже объект с таким же нормализованным названием.
+    
+    Args:
+        collection: Коллекция MongoDB
+        obj_id: Идентификатор объекта (URL/objId)
+        obj_commerc_nm: Название объекта
+        
+    Returns:
+        True если найден дубликат, False если дубликата нет
+    """
+    if not obj_commerc_nm:
+        return False
+        
+    try:
+        # Нормализуем название
+        normalized_name = normalize_name(obj_commerc_nm)
+        
+        # Ищем существующий объект с таким же нормализованным названием
+        existing_by_normalized = collection.find_one({
+            'normalized_name': normalized_name,
+            'objId': {'$ne': obj_id}
+        })
+        
+        if existing_by_normalized:
+            print(f"⚠️  Найден дубликат по нормализованному названию '{normalized_name}' (objId: {existing_by_normalized.get('objId')}, название: '{existing_by_normalized.get('objCommercNm')}'). Пропускаем обработку объекта {obj_id} ('{obj_commerc_nm}')")
+            return True
+            
+        return False
+        
+    except Exception as e:
+        print(f"Ошибка при проверке дубликата: {e}")
+        return False
+
+
 def upsert_object_smart(collection, obj_id: str, new_data: Dict[str, Any]) -> bool:
     """
     Умное обновление/создание записи в MongoDB.

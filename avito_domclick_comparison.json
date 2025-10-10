@@ -3,8 +3,8 @@
     "total_avito_records": 60,
     "processed_records": 60,
     "skipped_records": 0,
-    "matched_records": 41,
-    "match_percentage": 68.33333333333333
+    "matched_records": 40,
+    "match_percentage": 66.66666666666666
   },
   "matches": [
     {
@@ -246,12 +246,6 @@
       "domclick_name": "ЖК Паруса",
       "avito_id": "68e5f2e1eb188ee52e69108d",
       "domclick_id": "68e65f1825eeb4c75611e370"
-    },
-    {
-      "avito_name": "Микрорайон «NOVALAND»",
-      "domclick_name": "ЖК NOVALAND (Новалэнд)",
-      "avito_id": "68e5f2fdeb188ee52e69108f",
-      "domclick_id": "68e653f31ec83253111c9ca8"
     }
   ]
 }

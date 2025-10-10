@@ -14,6 +14,7 @@ from pathlib import Path
 from pymongo import MongoClient
 from dotenv import load_dotenv
 from typing import Dict, List, Any, Optional
+from rapidfuzz import fuzz
 
 # Корневая директория проекта
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -71,6 +72,36 @@ def transliterate_russian_to_latin(text: str) -> str:
     for char in text:
         result += translit_dict.get(char, char)
     return result
+
+
+def normalize_name_simple(name: str) -> str:
+    """Простая нормализация названия для rapidfuzz"""
+    if not name:
+        return ""
+
+    # Приводим к нижнему регистру
+    name = name.lower().strip()
+
+    # Убираем содержимое в скобках (транслитерации, пояснения)
+    name = re.sub(r'\([^)]*\)', '', name)
+
+    # Убираем кавычки и лишние символы (включая точки, тире, подчеркивания)
+    name = re.sub(r'[«»""\[\].—–\-_&]', ' ', name)
+
+    # Убираем префиксы
+    prefixes = ['жк', 'ток', 'комплекс жилых апартаментов', 'комплекс апартаментов',
+                'комплекс высотных домов', 'жилой комплекс', 'клубный дом',
+                'клубная резиденция', 'микрорайон', 'семейный квартал',
+                'знаковый квартал', 'красочный квартал', 'квартал']
+
+    for prefix in prefixes:
+        pattern = r'\b' + re.escape(prefix) + r'\b\s*'
+        name = re.sub(pattern, '', name, flags=re.IGNORECASE)
+
+    # Убираем множественные пробелы
+    name = re.sub(r'\s+', ' ', name).strip()
+
+    return name
 
 
 def normalize_name(name: str) -> str:
@@ -165,20 +196,20 @@ def find_matching_avito_record(domrf_record: Dict, avito_collection, used_avito_
         # Нормализуем название из Avito
         normalized_avito = normalize_name(avito_name)
 
-        # Вычисляем схожесть
-        similarity_score = calculate_similarity(normalized_domrf, normalized_avito)
+        # Вычисляем схожесть используя rapidfuzz
+        similarity_score = calculate_similarity_rapidfuzz(domrf_name, avito_name)
         comparison_count += 1
 
         # Показываем только если схожесть > 0.3 (чтобы видеть потенциальные совпадения)
         if similarity_score > 0.3:
             print(f"  📋 Avito: '{avito_name}' → нормализовано: '{normalized_avito}' | Схожесть: {similarity_score:.2f}")
 
-        if similarity_score > best_score and similarity_score > 0.8:  # Повышенный минимальный порог для точности
+        if similarity_score > best_score and similarity_score > 0.60:  # Повышенный минимальный порог для точности
             print(f"    ✅ НОВОЕ ЛУЧШЕЕ СОВПАДЕНИЕ! Схожесть: {similarity_score:.2f}")
             best_score = similarity_score
             best_match = record
         elif similarity_score > 0.5:  # Показываем близкие совпадения
-            print(f"    ⚠️  Близкое совпадение, но недостаточно (нужно >0.8)")
+            print(f"    ⚠️  Близкое совпадение, но недостаточно (нужно >0.60)")
 
     print(f"📊 Сравнено с {comparison_count} записями из Avito (доступно: {len(avito_records)})")
     if best_match:
@@ -186,7 +217,7 @@ def find_matching_avito_record(domrf_record: Dict, avito_collection, used_avito_
         avito_name = development.get('name', '')
         print(f"🏆 ЛУЧШЕЕ СОВПАДЕНИЕ: '{avito_name}' (схожесть: {best_score:.2f})")
     else:
-        print(f"❌ Совпадений не найдено (порог: 0.8)")
+        print(f"❌ Совпадений не найдено (порог: 0.60)")
 
     print()
     return best_match
@@ -224,8 +255,8 @@ def find_matching_domclick_record(domrf_record: Dict, domclick_collection, used_
         # Нормализуем название из DomClick
         normalized_domclick = normalize_name(domclick_name)
 
-        # Вычисляем схожесть
-        similarity_score = calculate_similarity(normalized_domrf, normalized_domclick)
+        # Вычисляем схожесть используя rapidfuzz
+        similarity_score = calculate_similarity_rapidfuzz(domrf_name, domclick_name)
         comparison_count += 1
 
         # Показываем только если схожесть > 0.3 (чтобы видеть потенциальные совпадения)
@@ -233,12 +264,12 @@ def find_matching_domclick_record(domrf_record: Dict, domclick_collection, used_
             print(
                 f"  📋 DomClick: '{domclick_name}' → нормализовано: '{normalized_domclick}' | Схожесть: {similarity_score:.2f}")
 
-        if similarity_score > best_score and similarity_score > 0.8:  # Повышенный минимальный порог для точности
+        if similarity_score > best_score and similarity_score > 0.60:  # Повышенный минимальный порог для точности
             print(f"    ✅ НОВОЕ ЛУЧШЕЕ СОВПАДЕНИЕ! Схожесть: {similarity_score:.2f}")
             best_score = similarity_score
             best_match = record
         elif similarity_score > 0.5:  # Показываем близкие совпадения
-            print(f"    ⚠️  Близкое совпадение, но недостаточно (нужно >0.8)")
+            print(f"    ⚠️  Близкое совпадение, но недостаточно (нужно >0.60)")
 
     print(f"📊 Сравнено с {comparison_count} записями из DomClick (доступно: {len(domclick_records)})")
     if best_match:
@@ -246,7 +277,7 @@ def find_matching_domclick_record(domrf_record: Dict, domclick_collection, used_
         domclick_name = development.get('complex_name', '')
         print(f"🏆 ЛУЧШЕЕ СОВПАДЕНИЕ: '{domclick_name}' (схожесть: {best_score:.2f})")
     else:
-        print(f"❌ Совпадений не найдено (порог: 0.8)")
+        print(f"❌ Совпадений не найдено (порог: 0.60)")
 
     print()
     return best_match
@@ -284,6 +315,36 @@ def split_compound_word(word: str, other_words: set) -> set:
             parts.add(part2)
 
     return parts
+
+
+def calculate_similarity_rapidfuzz(name1: str, name2: str) -> float:
+    """Вычисляет схожесть между двумя названиями ЖК используя rapidfuzz с поддержкой транслитерации"""
+    if not name1 or not name2:
+        return 0.0
+
+    # Нормализуем названия
+    norm1 = normalize_name_simple(name1)
+    norm2 = normalize_name_simple(name2)
+
+    # Вариант 1: Прямое сравнение (оба на кириллице или оба на латинице)
+    ratio_direct = fuzz.token_sort_ratio(norm1, norm2, processor=str.lower)
+
+    # Вариант 2: Транслитерируем оба в латиницу и сравниваем
+    trans1 = transliterate_russian_to_latin(norm1)
+    trans2 = transliterate_russian_to_latin(norm2)
+    ratio_transliterated = fuzz.token_sort_ratio(trans1, trans2, processor=str.lower)
+
+    # Вариант 3: Сравниваем norm1 с trans2 (для случаев когда один уже на латинице)
+    ratio_cross1 = fuzz.token_sort_ratio(norm1, trans2, processor=str.lower)
+
+    # Вариант 4: Сравниваем trans1 с norm2 (для случаев когда второй уже на латинице)
+    ratio_cross2 = fuzz.token_sort_ratio(trans1, norm2, processor=str.lower)
+
+    # Берем максимальный результат из всех вариантов
+    max_ratio = max(ratio_direct, ratio_transliterated, ratio_cross1, ratio_cross2)
+
+    # Конвертируем в 0-1 диапазон
+    return max_ratio / 100.0
 
 
 def calculate_similarity(name1: str, name2: str) -> float:

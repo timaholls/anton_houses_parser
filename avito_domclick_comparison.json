@@ -3,8 +3,8 @@
     "total_avito_records": 60,
     "processed_records": 60,
     "skipped_records": 0,
-    "matched_records": 40,
-    "match_percentage": 66.66666666666666
+    "matched_records": 46,
+    "match_percentage": 76.66666666666667
   },
   "matches": [
     {
@@ -56,6 +56,12 @@
       "domclick_id": "68e6600b25eeb4c75611e376"
     },
     {
+      "avito_name": "ЖК «ZORGE Premiere» (ЖК «Зорге.Премьер»)",
+      "domclick_name": "ЖК \"Зорге.Премьер\"",
+      "avito_id": "68e5071f6e69cd78359abef3",
+      "domclick_id": "68e6586925eeb4c75611e34e"
+    },
+    {
       "avito_name": "ЖК «Grand&Grand»",
       "domclick_name": "ЖК \"Grand&Grand (Гранд&Гранд)\"",
       "avito_id": "68e507336e69cd78359abef5",
@@ -72,6 +78,18 @@
       "domclick_name": "ЖК Квартал Самоцветы",
       "avito_id": "68e507676e69cd78359abefb",
       "domclick_id": "68e6542c1ec83253111c9cac"
+    },
+    {
+      "avito_name": "ЖК «Urman City» (Урман Сити)",
+      "domclick_name": "ЖК URMAN Сity (Урман Сити)",
+      "avito_id": "68e5077a6e69cd78359abefd",
+      "domclick_id": "68e6578425eeb4c75611e342"
+    },
+    {
+      "avito_name": "ЖК «Новый Империал»",
+      "domclick_name": "ЖК Новый Фамильный",
+      "avito_id": "68e5078c6e69cd78359abeff",
+      "domclick_id": "68e65ec025eeb4c75611e36c"
     },
     {
       "avito_name": "ЖК «Greenwich»",
@@ -182,10 +200,10 @@
       "domclick_id": "68e65db225eeb4c75611e362"
     },
     {
-      "avito_name": "ЖК «Новый Умный дом «Гелиос»",
-      "domclick_name": "ЖК Умный дом",
-      "avito_id": "68e50c0a6e69cd78359abf31",
-      "domclick_id": "68e664b925eeb4c75611e3aa"
+      "avito_name": "Клубный дом «NEW BRIDGE»",
+      "domclick_name": "ЖК NEW BRIDGE (Нью Бридж)",
+      "avito_id": "68e50b006e69cd78359abf2f",
+      "domclick_id": "68e65e9c25eeb4c75611e36a"
     },
     {
       "avito_name": "ЖК «The Prime»",
@@ -195,9 +213,9 @@
     },
     {
       "avito_name": "ЖК «Новый Фамильный»",
-      "domclick_name": "ЖК Новый Фамильный",
+      "domclick_name": "ЖК Grand Family ( ЖК Гранд Фемели)",
       "avito_id": "68e50c7b6e69cd78359abf37",
-      "domclick_id": "68e65ec025eeb4c75611e36c"
+      "domclick_id": "68e65d3525eeb4c75611e35e"
     },
     {
       "avito_name": "ЖК «Урбан Мартен»",
@@ -224,6 +242,12 @@
       "domclick_id": "68e6608525eeb4c75611e37c"
     },
     {
+      "avito_name": "Семейный квартал «Черника»",
+      "domclick_name": "ЖК Черника",
+      "avito_id": "68e50d8f6e69cd78359abf45",
+      "domclick_id": "68e653291ec83253111c9ca0"
+    },
+    {
       "avito_name": "ЖК «Матур‎»",
       "domclick_name": "ЖК MATUR (МАТУР)",
       "avito_id": "68e50dce6e69cd78359abf47",
@@ -236,6 +260,12 @@
       "domclick_id": "68e6623725eeb4c75611e392"
     },
     {
+      "avito_name": "ЖК «Vidineevsky»",
+      "domclick_name": "ЖК Видинеевский",
+      "avito_id": "68e50e326e69cd78359abf4d",
+      "domclick_id": "68e652881ec83253111c9c9a"
+    },
+    {
       "avito_name": "ЖК «AURUM»",
       "domclick_name": "ЖК АУРУМ",
       "avito_id": "68e5f2a1eb188ee52e691089",
@@ -246,6 +276,12 @@
       "domclick_name": "ЖК Паруса",
       "avito_id": "68e5f2e1eb188ee52e69108d",
       "domclick_id": "68e65f1825eeb4c75611e370"
+    },
+    {
+      "avito_name": "Микрорайон «NOVALAND»",
+      "domclick_name": "ЖК «Новалэнд»",
+      "avito_id": "68e5f2fdeb188ee52e69108f",
+      "domclick_id": "68e65c5425eeb4c75611e35a"
     }
   ]
 }

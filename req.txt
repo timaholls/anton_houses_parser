@@ -1,0 +1,14 @@
+appdirs==1.4.4
+certifi==2025.10.5
+dnspython==2.8.0
+importlib_metadata==8.7.0
+pyee==11.1.1
+pymongo==4.15.3
+pyppeteer==2.0.0
+python-dotenv==1.1.1
+RapidFuzz==3.14.1
+tqdm==4.67.1
+typing_extensions==4.15.0
+urllib3==1.26.20
+websockets==10.4
+zipp==3.23.0

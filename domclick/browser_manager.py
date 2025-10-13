@@ -3,7 +3,8 @@ import random
 
 
 # Настройки браузера
-EXECUTABLE_PATH = "/usr/bin/google-chrome-stable"
+EXECUTABLE_PATH = "C:\Program Files\Google\Chrome\Application\chrome.exe"
+# EXECUTABLE_PATH = "/usr/bin/google-chrome-stable"
 PROXY_HOST = "192.168.0.148"
 PROXY_PORTS = [3128, 3129, 3130, 3131, 3132, 3133, 3134, 3135, 3136]
 

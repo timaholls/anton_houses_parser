@@ -990,7 +990,6 @@ async def run() -> None:
             # При ошибках (прокси/соединение) — перезапускаем браузер и пробуем ещё раз.
             if aggregated_hod_url:
                 complex_id = get_complex_id_from_url(aggregated_complex_href or base_url)
-                complex_dir = create_complex_directory(complex_id)
                 max_attempts_hod = 3
                 attempt_hod = 0
                 while attempt_hod < max_attempts_hod and not construction_progress_data:

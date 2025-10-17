@@ -84,3 +84,4 @@ if __name__ == "__main__":
     image_path = "/home/art/PycharmProjects/anton_houses/media/complexes/8-nebo__121663/complex_photos/photo_1.jpg"
     test_upload_image(image_path)
 
+

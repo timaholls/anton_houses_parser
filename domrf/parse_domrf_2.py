@@ -19,6 +19,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 # Файлы для работы
 INPUT_JSON = PROJECT_ROOT / 'domrf_houses.json'
 PROGRESS_FILE = PROJECT_ROOT / 'object_details_progress.json'
+ERROR_OBJECTS_FILE = PROJECT_ROOT / 'error_objects.json'
 UPLOADS_DIR = PROJECT_ROOT / 'uploads'
 
 # Настройки повторных попыток
@@ -511,6 +512,44 @@ def save_progress(processed_ids, failed_ids):
         print(f"Ошибка при сохранении прогресса: {e}")
 
 
+def load_error_objects():
+    """Загружает список ошибочных объектов из файла"""
+    if os.path.exists(ERROR_OBJECTS_FILE):
+        try:
+            with open(ERROR_OBJECTS_FILE, 'r', encoding='utf-8') as f:
+                error_objects = json.load(f)
+                print(f"📋 Загружено {len(error_objects)} ошибочных объектов для повторной обработки")
+                return error_objects
+        except Exception as e:
+            print(f"Ошибка при загрузке ошибочных объектов: {e}")
+    return []
+
+
+def save_error_objects(error_objects):
+    """Сохраняет список ошибочных объектов в файл"""
+    try:
+        with open(ERROR_OBJECTS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(error_objects, f, ensure_ascii=False, indent=2)
+        print(f"💾 Сохранено {len(error_objects)} ошибочных объектов в файл")
+    except Exception as e:
+        print(f"Ошибка при сохранении ошибочных объектов: {e}")
+
+
+def add_error_object(error_objects, obj, error_reason):
+    """Добавляет объект в список ошибочных с причиной ошибки"""
+    error_entry = {
+        'objId': obj.get('objId'),
+        'objCommercNm': obj.get('objCommercNm'),
+        'url': f"https://наш.дом.рф/сервисы/каталог-новостроек/объект/{obj.get('objId')}",
+        'error_reason': error_reason,
+        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'full_object': obj
+    }
+    error_objects.append(error_entry)
+    print(f"❌ Объект {obj.get('objId')} добавлен в список ошибочных: {error_reason}")
+    return error_objects
+
+
 async def extract_object_details(page, obj_id, on_partial=None):
     """Извлекает детальную информацию об объекте со страницы"""
     url = f'https://наш.дом.рф/сервисы/каталог-новостроек/объект/{obj_id}'
@@ -860,6 +899,218 @@ async def extract_object_details(page, obj_id, on_partial=None):
     return details
 
 
+async def process_objects_batch(objects_to_process, collection, processed_ids, failed_ids, is_retry=False):
+    """Обрабатывает пакет объектов. Возвращает список ошибочных объектов."""
+    # Список для сохранения ошибочных объектов
+    error_objects = []
+    
+    # Создаем браузер один раз для всех объектов
+    browser = None
+    page = None
+    error_count = 0
+
+    try:
+        # Создаем браузер с антидетект-настройками (прокси настроено в open_browser.py)
+        browser, page = await setup_stealth_browser()
+        print("Браузер создан с антидетект-настройками")
+
+        # Обрабатываем объекты
+        retry_suffix = " (ПОВТОРНАЯ ПОПЫТКА)" if is_retry else ""
+        for i, obj in enumerate(objects_to_process):
+            obj_id = obj.get('objId')
+            obj_commerc_nm = obj.get('objCommercNm')
+            print(f"\n🔄 Обрабатываем объект {i + 1}/{len(objects_to_process)} (ID: {obj_id}){retry_suffix}")
+
+            # Проверяем дубликат в самом начале
+            if check_duplicate_by_name(collection, obj_id, obj_commerc_nm):
+                print(f"⏭️  Пропускаем объект {obj_id} из-за дубликата")
+                # Сохраняем прогресс
+                processed_ids.add(obj_id)
+                save_progress(processed_ids, failed_ids)
+                continue
+
+            # Цикл повторных попыток для одного объекта
+            max_retries_obj = 3
+            retry_obj = 0
+            obj_processed = False
+            error_reason = None
+
+            while retry_obj < max_retries_obj and not obj_processed:
+                try:
+                    # Колбэк для промежуточного сохранения текущего объекта
+                    def on_partial_save(details_partial):
+                        obj_copy = obj.copy()
+                        obj_copy['object_details'] = details_partial
+                        obj_copy['details_extracted_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
+                        try:
+                            upsert_object_smart(collection, obj_id, obj_copy)
+                        except Exception as inner_err:
+                            print(f"Ошибка при промежуточном сохранении в MongoDB: {inner_err}")
+
+                    # Извлекаем детали объекта с промежуточными сохранениями
+                    details = await extract_object_details(page, obj_id, on_partial=on_partial_save)
+
+                    if details == "PROXY_ERROR":
+                        retry_obj += 1
+                        error_reason = "Ошибка прокси"
+                        print(f"🔌 Ошибка прокси для объекта {obj_id}! Попытка {retry_obj}/{max_retries_obj}")
+                        error_count += 1
+
+                        if retry_obj < max_retries_obj:
+                            # Перезапускаем браузер при ошибке прокси
+                            try:
+                                await browser.close()
+                            except:
+                                pass
+                            await asyncio.sleep(2)
+                            browser, page = await setup_stealth_browser()
+                            print(f"🔄 Браузер перезапущен с новым прокси, повторяем объект {obj_id}")
+                            continue  # Повторяем while для того же объекта
+                        else:
+                            print(f"❌ Исчерпаны попытки для объекта {obj_id}")
+                            error_objects = add_error_object(error_objects, obj, error_reason)
+                            save_error_objects(error_objects)
+                            break
+                            
+                    elif details == "BAN_DETECTED":
+                        retry_obj += 1
+                        error_reason = "Обнаружен бан/капча"
+                        print(f"🚫 Обнаружен бан/капча для объекта {obj_id}! Попытка {retry_obj}/{max_retries_obj}")
+                        error_count += 1
+
+                        if retry_obj < max_retries_obj:
+                            # Перезапускаем браузер при бане/капче
+                            try:
+                                await browser.close()
+                            except:
+                                pass
+                            await asyncio.sleep(5)  # Увеличиваем задержку при бане
+                            browser, page = await setup_stealth_browser()
+                            print(f"🔄 Браузер перезапущен после обнаружения бана, повторяем объект {obj_id}")
+                            continue  # Повторяем while для того же объекта
+                        else:
+                            print(f"❌ Исчерпаны попытки для объекта {obj_id}")
+                            error_objects = add_error_object(error_objects, obj, error_reason)
+                            save_error_objects(error_objects)
+                            break
+                            
+                    elif details:
+                        # Добавляем детали к объекту
+                        obj_copy = obj.copy()
+                        obj_copy['object_details'] = details
+                        obj_copy['details_extracted_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
+
+                        # Обновляем запись в MongoDB используя умное сохранение
+                        try:
+                            if upsert_object_smart(collection, obj_id, obj_copy):
+                                print(f"✅ Данные объекта {obj_id} сохранены в MongoDB (коллекция domrf)")
+                                processed_ids.add(obj_id)
+
+                                # Сохраняем прогресс после каждого успешного объекта
+                                save_progress(processed_ids, failed_ids)
+
+                                # Сбрасываем счетчик ошибок при успехе
+                                error_count = 0
+                                error_reason = None  # Сбрасываем причину ошибки при успехе
+                                obj_processed = True  # Успешно обработан, выходим из while
+                            else:
+                                print(f"❌ Не удалось сохранить данные объекта {obj_id}")
+                                error_reason = "Не удалось сохранить данные в MongoDB"
+                                error_count += 1
+                                # Если это последняя попытка, добавляем в ошибки
+                                if retry_obj >= max_retries_obj - 1:
+                                    error_objects = add_error_object(error_objects, obj, error_reason)
+                                    save_error_objects(error_objects)
+
+                        except Exception as e:
+                            print(f"❌ Ошибка при сохранении в MongoDB: {e}")
+                            error_reason = f"Ошибка сохранения в MongoDB: {str(e)}"
+                            error_count += 1
+                            # Если это последняя попытка, добавляем в ошибки
+                            if retry_obj >= max_retries_obj - 1:
+                                error_objects = add_error_object(error_objects, obj, error_reason)
+                                save_error_objects(error_objects)
+                    else:
+                        print(f"❌ Не удалось извлечь данные для объекта {obj_id}")
+                        if not error_reason:
+                            error_reason = "Не удалось извлечь данные (пустой результат)"
+                        error_objects = add_error_object(error_objects, obj, error_reason)
+                        save_error_objects(error_objects)
+                        error_count += 1
+                        break  # Выходим из while, переходим к следующему объекту
+
+                except Exception as e:
+                    retry_obj += 1
+                    error_message = str(e)
+                    error_reason = f"Исключение: {error_message}"
+                    print(f"Ошибка при работе с объектом {obj_id}: {e} (попытка {retry_obj}/{max_retries_obj})")
+
+                    # Проверяем, является ли это ошибкой прокси или соединения
+                    connection_errors = [
+                        "ERR_PROXY_CONNECTION_FAILED",
+                        "ERR_CONNECTION_CLOSED", 
+                        "ERR_CONNECTION_REFUSED",
+                        "ERR_CONNECTION_RESET",
+                        "ERR_CONNECTION_ABORTED",
+                        "PROXY",
+                        "CONNECTION_CLOSED"
+                    ]
+                    
+                    if any(err in error_message for err in connection_errors):
+                        if retry_obj < max_retries_obj:
+                            print(f"🔌 Обнаружена ошибка подключения/прокси! Перезапускаем браузер...")
+                            try:
+                                await browser.close()
+                            except:
+                                pass
+                            await asyncio.sleep(2)
+                            browser, page = await setup_stealth_browser()
+                            print(f"🔄 Браузер перезапущен с новым прокси, повторяем объект {obj_id}")
+                            error_count += 1
+                            continue  # Повторяем while для того же объекта
+                        else:
+                            print(f"❌ Исчерпаны попытки для объекта {obj_id}")
+                            error_objects = add_error_object(error_objects, obj, error_reason)
+                            save_error_objects(error_objects)
+                            break
+
+                    error_count += 1
+                    error_objects = add_error_object(error_objects, obj, error_reason)
+                    save_error_objects(error_objects)
+                    break  # При других ошибках переходим к следующему объекту
+
+            # Перезапускаем браузер при накоплении ошибок
+            if error_count >= 10:
+                print(f"🚨 Накоплено {error_count} ошибок, перезапускаем браузер...")
+                try:
+                    await browser.close()
+                except:
+                    pass
+                await asyncio.sleep(3)
+                browser, page = await setup_stealth_browser()
+                print("Браузер перезапущен из-за накопления ошибок")
+                error_count = 0
+
+            # Пауза между объектами
+            await asyncio.sleep(random.uniform(2, 5))
+
+    except Exception as e:
+        print(f"Критическая ошибка: {e}")
+        if browser:
+            try:
+                await browser.close()
+            except:
+                pass
+    finally:
+        if browser:
+            try:
+                await browser.close()
+            except:
+                pass
+
+    return error_objects
+
+
 async def process_objects():
     """Основная функция обработки объектов"""
     # Загружаем JSON файл с объектами
@@ -894,152 +1145,46 @@ async def process_objects():
         print("Все объекты уже обработаны")
         return
 
-    # Создаем браузер один раз для всех объектов
-    browser = None
-    page = None
-    error_count = 0
+    # Первый проход - обработка основного списка объектов
+    print("\n" + "="*80)
+    print("🚀 ПЕРВЫЙ ПРОХОД - обработка основного списка объектов")
+    print("="*80 + "\n")
+    error_objects = await process_objects_batch(objects_to_process, collection, processed_ids, failed_ids, is_retry=False)
 
-    try:
-        # Создаем браузер с антидетект-настройками (прокси настроено в open_browser.py)
-        browser, page = await setup_stealth_browser()
-        print("Браузер создан с антидетект-настройками")
+    # Финальное сохранение прогресса после первого прохода
+    save_progress(list(processed_ids), list(failed_ids))
 
-        # Обрабатываем объекты
-        for i, obj in enumerate(objects_to_process):
-            obj_id = obj.get('objId')
-            obj_commerc_nm = obj.get('objCommercNm')
-            print(f"\n🔄 Обрабатываем объект {i + 1}/{len(objects_to_process)} (ID: {obj_id})")
-
-            # Проверяем дубликат в самом начале
-            if check_duplicate_by_name(collection, obj_id, obj_commerc_nm):
-                print(f"⏭️  Пропускаем объект {obj_id} из-за дубликата")
-                # Сохраняем прогресс
-                processed_ids.add(obj_id)
-                save_progress(processed_ids, failed_ids)
-                continue
-
-            try:
-                # Колбэк для промежуточного сохранения текущего объекта
-                def on_partial_save(details_partial):
-                    obj_copy = obj.copy()
-                    obj_copy['object_details'] = details_partial
-                    obj_copy['details_extracted_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
-                    try:
-                        upsert_object_smart(collection, obj_id, obj_copy)
-                    except Exception as inner_err:
-                        print(f"Ошибка при промежуточном сохранении в MongoDB: {inner_err}")
-
-                # Извлекаем детали объекта с промежуточными сохранениями
-                details = await extract_object_details(page, obj_id, on_partial=on_partial_save)
-
-                if details == "PROXY_ERROR":
-                    print(f"🔌 Ошибка прокси для объекта {obj_id}! Перезапускаем браузер с новым прокси...")
-                    error_count += 1
-
-                    # Перезапускаем браузер при ошибке прокси
-                    try:
-                        await browser.close()
-                    except:
-                        pass
-                    await asyncio.sleep(2)
-                    browser, page = await setup_stealth_browser()
-                    print("🔄 Браузер перезапущен с новым прокси")
-                    continue
-                elif details == "BAN_DETECTED":
-                    print(f"🚫 Обнаружен бан/капча для объекта {obj_id}! Перезапускаем браузер...")
-                    error_count += 1
-
-                    # Перезапускаем браузер при бане/капче
-                    try:
-                        await browser.close()
-                    except:
-                        pass
-                    await asyncio.sleep(5)  # Увеличиваем задержку при бане
-                    browser, page = await setup_stealth_browser()
-                    print("🔄 Браузер перезапущен после обнаружения бана")
-                    continue
-                elif details:
-                    # Добавляем детали к объекту
-                    obj_copy = obj.copy()
-                    obj_copy['object_details'] = details
-                    obj_copy['details_extracted_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
-
-                    # Обновляем запись в MongoDB используя умное сохранение
-                    try:
-                        if upsert_object_smart(collection, obj_id, obj_copy):
-                            print(f"✅ Данные объекта {obj_id} сохранены в MongoDB (коллекция domrf)")
-                            processed_ids.add(obj_id)
-
-                            # Сохраняем прогресс после каждого успешного объекта
-                            save_progress(processed_ids, failed_ids)
-
-                            # Сбрасываем счетчик ошибок при успехе
-                            error_count = 0
-                        else:
-                            print(f"❌ Не удалось сохранить данные объекта {obj_id}")
-                            error_count += 1
-
-                    except Exception as e:
-                        print(f"❌ Ошибка при сохранении в MongoDB: {e}")
-                        error_count += 1
-                else:
-                    print(f"❌ Не удалось извлечь данные для объекта {obj_id}")
-                    error_count += 1
-
-            except Exception as e:
-                error_message = str(e)
-                print(f"Ошибка при работе с объектом {obj_id}: {e}")
-
-                # Проверяем, является ли это ошибкой прокси или соединения
-                connection_errors = [
-                    "ERR_PROXY_CONNECTION_FAILED",
-                    "ERR_CONNECTION_CLOSED", 
-                    "ERR_CONNECTION_REFUSED",
-                    "ERR_CONNECTION_RESET",
-                    "ERR_CONNECTION_ABORTED",
-                    "PROXY",
-                    "CONNECTION_CLOSED"
-                ]
-                
-                if any(err in error_message for err in connection_errors):
-                    print(f"🔌 Обнаружена ошибка подключения/прокси! Перезапускаем браузер...")
-                    try:
-                        await browser.close()
-                    except:
-                        pass
-                    await asyncio.sleep(2)
-                    browser, page = await setup_stealth_browser()
-                    print("🔄 Браузер перезапущен с новым прокси")
-
-                error_count += 1
-
-            # Перезапускаем браузер при накоплении ошибок
-            if error_count >= 10:
-                print(f"🚨 Накоплено {error_count} ошибок, перезапускаем браузер...")
-                try:
-                    await browser.close()
-                except:
-                    pass
-                await asyncio.sleep(3)
-                browser, page = await setup_stealth_browser()
-                print("Браузер перезапущен из-за накопления ошибок")
-                error_count = 0
-
-            # Пауза между объектами
-            await asyncio.sleep(random.uniform(2, 5))
-
-    except Exception as e:
-        print(f"Критическая ошибка: {e}")
-        if browser:
-            try:
-                await browser.close()
-            except:
-                pass
+    # Второй проход - повторная обработка ошибочных объектов
+    if error_objects:
+        print("\n" + "="*80)
+        print(f"🔄 ВТОРОЙ ПРОХОД - повторная обработка {len(error_objects)} ошибочных объектов")
+        print("="*80 + "\n")
+        
+        # Извлекаем полные объекты из ошибочных записей
+        retry_objects = [error_obj['full_object'] for error_obj in error_objects]
+        
+        # Повторно обрабатываем ошибочные объекты
+        remaining_errors = await process_objects_batch(retry_objects, collection, processed_ids, failed_ids, is_retry=True)
+        
+        # Сохраняем оставшиеся ошибки
+        if remaining_errors:
+            print(f"\n⚠️  После повторной обработки осталось {len(remaining_errors)} ошибочных объектов")
+            save_error_objects(remaining_errors)
+        else:
+            print(f"\n✅ Все ошибочные объекты успешно обработаны при повторной попытке!")
+            # Очищаем файл с ошибками
+            if os.path.exists(ERROR_OBJECTS_FILE):
+                os.remove(ERROR_OBJECTS_FILE)
+                print("🗑️  Файл с ошибочными объектами удален")
+    else:
+        print("\n✅ Ошибочных объектов не обнаружено!")
 
     # Финальное сохранение прогресса
     save_progress(list(processed_ids), list(failed_ids))
 
-    print(f"\n✅ Обработка завершена!")
+    print(f"\n" + "="*80)
+    print(f"✅ ОБРАБОТКА ЗАВЕРШЕНА!")
+    print(f"="*80)
     print(f"Успешно обработано: {len(processed_ids)}")
     print(f"Ошибок: {len(failed_ids)}")
     print(f"Всего в JSON файле: {len(objects)} объектов")

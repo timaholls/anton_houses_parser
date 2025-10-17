@@ -58,11 +58,26 @@ def compare_and_merge_data(existing_data, new_data):
         
         for apt_type, apt_data in new_data['apartment_types'].items():
             if apt_data and 'apartments' in apt_data:  # Только если есть данные квартир
-                old_count = len(merged['apartment_types'].get(apt_type, {}).get('apartments', []))
-                new_count = len(apt_data['apartments'])
+                old_apartments = merged['apartment_types'].get(apt_type, {}).get('apartments', [])
+                new_apartments = apt_data['apartments']
                 
-                if apt_type not in merged['apartment_types'] or old_count != new_count:
+                # Сравниваем не только количество, но и содержимое (особенно пути к фото)
+                apartments_changed = False
+                if len(old_apartments) != len(new_apartments):
+                    apartments_changed = True
+                else:
+                    # Проверяем изменения в фотографиях квартир
+                    for old_apt, new_apt in zip(old_apartments, new_apartments):
+                        old_photos = old_apt.get('photos', [])
+                        new_photos = new_apt.get('photos', [])
+                        if old_photos != new_photos:
+                            apartments_changed = True
+                            break
+                
+                if apt_type not in merged['apartment_types'] or apartments_changed:
                     merged['apartment_types'][apt_type] = apt_data
+                    old_count = len(old_apartments)
+                    new_count = len(new_apartments)
                     changes.append(f"apartment_types.{apt_type} ({old_count} → {new_count} квартир)")
     
     # Обновляем total_apartments

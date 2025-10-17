@@ -41,6 +41,7 @@ UPLOADS_DIR = PROJECT_ROOT / "uploads"
 from browser_manager import create_browser, create_browser_page, restart_browser
 from db_manager import save_to_mongodb
 from resize_img import ImageProcessor
+from s3_service import S3Service
 
 LINKS_FILE = PROJECT_ROOT / "complex_links.json"
 PROGRESS_FILE = PROJECT_ROOT / "progress_domclick_2.json"
@@ -294,23 +295,39 @@ async def extract_construction_from_domclick(page, hod_url: str) -> Dict[str, An
         return {"construction_stages": []}
 
 
-async def process_construction_stages_domclick(stages: List[Dict[str, Any]], complex_dir: Path) -> Dict[str, Any]:
-    """Скачивает фото по этапам и возвращает структуру construction_progress с локальными путями."""
+async def process_construction_stages_domclick(stages: List[Dict[str, Any]], complex_id: str) -> Dict[str, Any]:
+    """Скачивает фото по этапам и загружает в S3, возвращает структуру construction_progress с URL."""
     if not stages:
         return {"construction_stages": []}
-    base_constr = complex_dir / "construction"
+    s3 = S3Service()
     result_stages = []
     async with aiohttp.ClientSession() as session:
         for s in stages:
             stage_num = s.get("stage_number") or (len(result_stages) + 1)
-            stage_dir = base_constr / f"stage_{stage_num}"
             urls = (s.get("photos") or [])[:5]  # скачиваем не более 5 фото на этап
             saved = []
             sem = asyncio.Semaphore(5)
             async def work(u, idx):
                 async with sem:
-                    fp = stage_dir / f"photo_{idx+1}.jpg"
-                    return await download_and_process_image(session, u, fp)
+                    try:
+                        async with session.get(u, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                            if response.status != 200:
+                                return None
+                            raw = await response.read()
+                    except Exception:
+                        return None
+                    input_bytes = BytesIO(raw)
+                    try:
+                        processed = image_processor.process(input_bytes)
+                    except Exception:
+                        return None
+                    processed.seek(0)
+                    data = processed.read()
+                    key = f"complexes/{complex_id}/construction/stage_{stage_num}/photo_{idx + 1}.jpg"
+                    try:
+                        return s3.upload_bytes(data, key, content_type="image/jpeg")
+                    except Exception:
+                        return None
             tasks = [work(u, i) for i, u in enumerate(urls)]
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for p in results:
@@ -414,16 +431,16 @@ async def download_and_process_image(session: aiohttp.ClientSession, image_url: 
         return None
 
 
-async def process_complex_photos(photo_urls: List[str], complex_dir: Path) -> List[str]:
+async def process_complex_photos(photo_urls: List[str], complex_id: str) -> List[str]:
     """
-    Обрабатывает список URL фотографий ЖК и сохраняет их локально.
-    Возвращает список путей к файлам.
+    Обрабатывает список URL фотографий ЖК и загружает их в S3.
+    Возвращает список публичных URL.
     """
     if not photo_urls:
         return []
 
     processed_photos = []
-    complex_photos_dir = complex_dir / "complex_photos"
+    s3 = S3Service()
 
     async with aiohttp.ClientSession() as session:
         # Обрабатываем до 5 фотографий параллельно
@@ -431,8 +448,31 @@ async def process_complex_photos(photo_urls: List[str], complex_dir: Path) -> Li
 
         async def process_single_photo(url, index):
             async with semaphore:
-                file_path = complex_photos_dir / f"photo_{index + 1}.jpg"
-                return await download_and_process_image(session, url, file_path)
+                # Скачиваем исходник
+                try:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                        if response.status != 200:
+                            return None
+                        raw = await response.read()
+                except Exception:
+                    return None
+
+                # Обрабатываем через resize
+                input_bytes = BytesIO(raw)
+                try:
+                    processed = image_processor.process(input_bytes)
+                except Exception:
+                    return None
+                processed.seek(0)
+                data = processed.read()
+
+                # Загружаем в S3
+                key = f"complexes/{complex_id}/complex_photos/photo_{index + 1}.jpg"
+                try:
+                    url_public = s3.upload_bytes(data, key, content_type="image/jpeg")
+                    return url_public
+                except Exception:
+                    return None
 
         tasks = [process_single_photo(url, i) for i, url in enumerate(photo_urls[:8])]  # максимум 8 фото ЖК
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -445,10 +485,10 @@ async def process_complex_photos(photo_urls: List[str], complex_dir: Path) -> Li
     return processed_photos
 
 
-async def process_apartment_photos(apartment_data: Dict[str, Any], apartment_dir: Path) -> Dict[str, Any]:
+async def process_apartment_photos(apartment_data: Dict[str, Any], complex_id: str, apartment_path: str) -> Dict[str, Any]:
     """
-    Обрабатывает фотографии для одной квартиры и сохраняет их локально.
-    Возвращает данные с путями к файлам.
+    Обрабатывает фотографии для одной квартиры и загружает в S3.
+    Возвращает данные с URL к файлам.
     """
     if not apartment_data.get("images"):
         return {
@@ -464,6 +504,7 @@ async def process_apartment_photos(apartment_data: Dict[str, Any], apartment_dir
         }
 
     processed_images = []
+    s3 = S3Service()
 
     async with aiohttp.ClientSession() as session:
         # Обрабатываем до 3 фотографий параллельно для квартир
@@ -471,8 +512,28 @@ async def process_apartment_photos(apartment_data: Dict[str, Any], apartment_dir
 
         async def process_single_photo(url, index):
             async with semaphore:
-                file_path = apartment_dir / f"photo_{index + 1}.jpg"
-                return await download_and_process_image(session, url, file_path)
+                try:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                        if response.status != 200:
+                            return None
+                        raw = await response.read()
+                except Exception:
+                    return None
+
+                input_bytes = BytesIO(raw)
+                try:
+                    processed = image_processor.process(input_bytes)
+                except Exception:
+                    return None
+                processed.seek(0)
+                data = processed.read()
+
+                key = f"complexes/{complex_id}/apartments/{apartment_path}/photo_{index + 1}.jpg"
+                try:
+                    url_public = s3.upload_bytes(data, key, content_type="image/jpeg")
+                    return url_public
+                except Exception:
+                    return None
 
         tasks = [process_single_photo(url, i) for i, url in enumerate(image_urls[:3])]  # максимум 3 фото на квартиру
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -485,7 +546,7 @@ async def process_apartment_photos(apartment_data: Dict[str, Any], apartment_dir
             else:
                 logger.warning(f"Фото {i + 1} не обработано: {type(result)}")
 
-    # Возвращаем данные квартиры с путями к файлам
+    # Возвращаем данные квартиры с URL к файлам
     result = {
         "offer": apartment_data.get("offer"),
         "photos": processed_images
@@ -493,15 +554,14 @@ async def process_apartment_photos(apartment_data: Dict[str, Any], apartment_dir
     return result
 
 
-async def process_all_apartment_types(apartment_types: Dict[str, Any], complex_dir: Path) -> Dict[str, Any]:
+async def process_all_apartment_types(apartment_types: Dict[str, Any], complex_id: str) -> Dict[str, Any]:
     """
-    Обрабатывает все фотографии во всех типах квартир и сохраняет их локально.
+    Обрабатывает все фотографии во всех типах квартир и загружает в S3.
     """
     if not apartment_types:
         return apartment_types
 
     processed_types = {}
-    apartments_dir = complex_dir / "apartments"
 
     for apartment_type, type_data in apartment_types.items():
         # Обрабатываем разные структуры данных
@@ -517,12 +577,12 @@ async def process_all_apartment_types(apartment_types: Dict[str, Any], complex_d
             continue
 
         processed_apartments = []
-        apartment_type_dir = apartments_dir / apartment_type.replace('-', '_').replace('комн', 'komn')
+        apartment_type_normalized = apartment_type.replace('-', '_').replace('комн', 'komn')
 
         for i, apartment in enumerate(apartments):
             if isinstance(apartment, dict):
-                apartment_dir = apartment_type_dir / f"apartment_{i + 1}"
-                processed_apartment = await process_apartment_photos(apartment, apartment_dir)
+                apartment_path = f"{apartment_type_normalized}/apartment_{i + 1}"
+                processed_apartment = await process_apartment_photos(apartment, complex_id, apartment_path)
                 processed_apartments.append(processed_apartment)
             else:
                 processed_apartments.append(apartment)
@@ -859,7 +919,7 @@ async def run() -> None:
                             await asyncio.sleep(2)
 
             # формируем запись под Mongo-схему
-            def to_db_item(complex_photos_paths: List[str] = None, processed_apartment_types: Dict[str, Any] = None) -> \
+            def to_db_item(complex_photos_urls: List[str] = None, processed_apartment_types: Dict[str, Any] = None) -> \
                     Dict[str, Any]:
                 # Используем обработанные данные квартир, если они есть
                 apartment_types_data = processed_apartment_types or aggregated_offers
@@ -873,7 +933,7 @@ async def run() -> None:
                             "apartments": [
                                 {
                                     "title": c.get("offer"),
-                                    "photos": c.get("photos") or [],  # пути к файлам
+                                    "photos": c.get("photos") or [],  # URL к файлам в S3
                                 }
                                 for c in cards
                             ]
@@ -885,7 +945,7 @@ async def run() -> None:
                             "apartments": [
                                 {
                                     "title": c.get("offer"),
-                                    "photos": c.get("photos") or [],  # пути к файлам
+                                    "photos": c.get("photos") or [],  # URL к файлам в S3
                                 }
                                 for c in apartment_list
                             ]
@@ -900,29 +960,28 @@ async def run() -> None:
                         "complex_name": aggregated_complex_name,
                         "address": aggregated_address,
                         "source_url": base_url,
-                        "photos": complex_photos_paths or [],  # пути к фотографиям ЖК
+                        "photos": complex_photos_urls or [],  # URL к фотографиям ЖК в S3
                     },
                     "apartment_types": apartment_types,
                 }
 
-            # Создаем структуру папок для комплекса
+            # Получаем ID комплекса для формирования ключей S3
             complex_id = get_complex_id_from_url(aggregated_complex_href or base_url)
-            complex_dir = create_complex_directory(complex_id)
 
-            # Обрабатываем фотографии ЖК и сохраняем локально
-            complex_photos_paths = []
+            # Обрабатываем фотографии ЖК и загружаем в S3
+            complex_photos_urls = []
             if complex_gallery_images:
                 try:
-                    complex_photos_paths = await process_complex_photos(complex_gallery_images, complex_dir)
+                    complex_photos_urls = await process_complex_photos(complex_gallery_images, complex_id)
                 except Exception as e:
                     logger.error(f"Ошибка при обработке фотографий ЖК: {e}")
-                    complex_photos_paths = []
+                    complex_photos_urls = []
 
-            # Обрабатываем фотографии всех квартир и сохраняем локально
+            # Обрабатываем фотографии всех квартир и загружаем в S3
             processed_apartment_types = aggregated_offers
             if aggregated_offers:
                 try:
-                    processed_apartment_types = await process_all_apartment_types(aggregated_offers, complex_dir)
+                    processed_apartment_types = await process_all_apartment_types(aggregated_offers, complex_id)
                 except Exception as e:
                     logger.error(f"Ошибка при обработке фотографий квартир: {e}")
                     processed_apartment_types = aggregated_offers
@@ -941,7 +1000,7 @@ async def run() -> None:
                         stages_data = await extract_construction_from_domclick(page, aggregated_hod_url)
                         if stages_data and stages_data.get('construction_stages'):
                             print(f"  Найдено этапов: {len(stages_data['construction_stages'])}")
-                            construction_progress_data = await process_construction_stages_domclick(stages_data['construction_stages'], complex_dir)
+                            construction_progress_data = await process_construction_stages_domclick(stages_data['construction_stages'], complex_id)
                             break
                         else:
                             print("  ⚠️ Этапы не получены со страницы хода строительства")
@@ -960,7 +1019,7 @@ async def run() -> None:
                             except Exception as restart_error:
                                 print(f"  ⚠️ Ошибка перезапуска браузера: {restart_error}")
 
-            db_item = to_db_item(complex_photos_paths, processed_apartment_types)
+            db_item = to_db_item(complex_photos_urls, processed_apartment_types)
             if construction_progress_data:
                 db_item.setdefault('development', {})['construction_progress'] = construction_progress_data
 
@@ -973,7 +1032,7 @@ async def run() -> None:
                 results.append({"sourceUrl": base_url,
                                 "data": {"address": aggregated_address, "complexName": aggregated_complex_name,
                                          "complexHref": aggregated_complex_href, "offers": processed_apartment_types,
-                                         "complexPhotosPaths": complex_photos_paths}})
+                                         "complexPhotosUrls": complex_photos_urls}})
                 with open(str(OUTPUT_FILE), 'w', encoding='utf-8') as f:
                     json.dump(results, f, ensure_ascii=False, indent=2)
 

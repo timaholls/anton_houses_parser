@@ -11,6 +11,7 @@ from browser_manager import setup_stealth_browser
 from db_config import get_collection, upsert_object_smart, check_duplicate_by_name
 import aiohttp
 from resize_img import ImageProcessor
+from s3_service import S3Service
 
 # Директория текущего скрипта
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -35,7 +36,8 @@ def create_object_directory(obj_id: str) -> Path:
     return base_dir
 
 
-async def download_and_process_image(session: aiohttp.ClientSession, image_url: str, file_path: Path) -> str:
+async def download_and_process_image(session: aiohttp.ClientSession, image_url: str, s3_key: str, s3: S3Service) -> str:
+    """Скачивает, обрабатывает и загружает изображение в S3. Возвращает публичный URL."""
     try:
         async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=30)) as response:
             if response.status != 200:
@@ -45,27 +47,27 @@ async def download_and_process_image(session: aiohttp.ClientSession, image_url: 
             processed = image_processor.process(BytesIO(image_bytes))
             processed.seek(0)
             data = processed.read()
-            file_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(file_path, 'wb') as f:
-                f.write(data)
-            return str(file_path.relative_to(UPLOADS_DIR)).replace('\\', '/')
+            # Загружаем в S3 вместо локального сохранения
+            return s3.upload_bytes(data, s3_key, content_type="image/jpeg")
     except Exception as e:
         logger.error(f"Ошибка скачивания/обработки {image_url}: {e}")
         return None
 
 
-async def process_photo_list(photo_urls, target_dir: Path, prefix: str, limit: int = None):
+async def process_photo_list(photo_urls, s3_key_prefix: str, prefix: str, limit: int = None):
+    """Загружает список фото в S3. Возвращает список публичных URL."""
     if not photo_urls:
         return []
     if limit is not None:
         photo_urls = list(photo_urls)[:limit]
     results = []
+    s3 = S3Service()
     async with aiohttp.ClientSession() as session:
         sem = asyncio.Semaphore(5)
         async def work(url, idx):
             async with sem:
-                file_path = target_dir / f"{prefix}_{idx + 1}.jpg"
-                return await download_and_process_image(session, url, file_path)
+                s3_key = f"{s3_key_prefix}/{prefix}_{idx + 1}.jpg"
+                return await download_and_process_image(session, url, s3_key, s3)
         tasks = [work(u, i) for i, u in enumerate(photo_urls)]
         saved = await asyncio.gather(*tasks, return_exceptions=True)
         for p in saved:
@@ -720,11 +722,11 @@ async def extract_object_details(page, obj_id, on_partial=None):
         print(f"📷 Извлекаем фото галереи для объекта {obj_id}")
         gallery_photos_urls = await extract_gallery_images(page)
         if gallery_photos_urls:
-            # Сохраняем фото локально, как в domclick_2
-            base_dir = create_object_directory(str(obj_id))
-            saved_gallery = await process_photo_list(gallery_photos_urls, base_dir / 'gallery', 'photo', limit=12)
+            # Загружаем фото в S3
+            s3_key_prefix = f"objects/{obj_id}/gallery"
+            saved_gallery = await process_photo_list(gallery_photos_urls, s3_key_prefix, 'photo', limit=12)
             details['gallery_photos'] = saved_gallery
-            print(f"📸 Галерея сохранена: {len(saved_gallery)} файлов")
+            print(f"📸 Галерея загружена в S3: {len(saved_gallery)} файлов")
         else:
             print("ℹ️ Фото галереи не найдены")
 
@@ -800,10 +802,8 @@ async def extract_object_details(page, obj_id, on_partial=None):
         # Получаем данные о ходе строительства и фотографиях
         print(f"🏗️  Извлекаем данные о ходе строительства для объекта {obj_id}")
         construction_data = await extract_construction_progress(page)
-        # Сохраняем фото хода строительства локально (если есть)
+        # Загружаем фото хода строительства в S3 (если есть)
         if construction_data:
-            base_dir = create_object_directory(str(obj_id))
-            
             # Фото по этапам
             stages = construction_data.get('construction_stages') or []
             for idx, stage in enumerate(stages):
@@ -811,8 +811,8 @@ async def extract_object_details(page, obj_id, on_partial=None):
                 if not photos:
                     continue
                 stage_num = stage.get('stage_number') or (idx + 1)
-                stage_dir = base_dir / 'construction' / f'stage_{stage_num}'
-                saved_stage = await process_photo_list(photos, stage_dir, 'photo', limit=10)
+                s3_key_prefix = f"objects/{obj_id}/construction/stage_{stage_num}"
+                saved_stage = await process_photo_list(photos, s3_key_prefix, 'photo', limit=10)
                 stage['photos'] = saved_stage
             
             # Убираем общий массив photos, оставляем только по этапам

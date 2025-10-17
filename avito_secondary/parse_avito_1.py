@@ -85,7 +85,7 @@ async def main() -> None:
     page = await create_browser_page(browser)
     print(f"✅ Браузер запущен с прокси: {proxy_url}")
 
-    base_url = "https://www.avito.ru/ufa/kvartiry/catalog/novostroyki-ASgBAgICA0SSA8YQ5geOUvLFDvCTmgI"
+    base_url = "https://www.avito.ru/ufa/kvartiry/prodam/vtorichka-ASgBAgICAkSSA8YQ5geMUg?context=H4sIAAAAAAAA_wEtANL_YToxOntzOjg6ImZyb21QYWdlIjtzOjE2OiJzZWFyY2hGb3JtV2lkZ2V0Ijt9F_yIfi0AAAA"
     all_catalog_links = []
 
     try:

@@ -91,6 +91,239 @@ def get_complex_id_from_url(url: str) -> str:
     return hashlib.md5(url.encode()).hexdigest()[:10]
 
 
+async def extract_construction_from_domclick(page, hod_url: str) -> Dict[str, Any]:
+    """Переходит на страницу хода строительства Domclick и извлекает даты и ссылки на фото со всех страниц пагинации.
+    Возвращает { construction_stages: [{stage_number, date, photos: [urls<=5]}] }.
+    """
+    script = """
+    async (targetUrl) => {
+      try {
+        // Навигация на страницу "Ход строительства"
+        if (location.href !== targetUrl) {
+          history.scrollRestoration = 'manual';
+        }
+      } catch (e) {}
+      return null;
+    }
+    """
+    try:
+        # Переходим на страницу хода строительства
+        await page.goto(hod_url, timeout=120000)
+        await asyncio.sleep(3)
+
+        # Клик по бейджу и по чекбоксу "2025" в ОДНОМ evaluate (с задержками)
+        try:
+            clicked_2025 = await page.evaluate(r"""
+            async () => {
+              const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+              // 1) Клик по бейджу
+              const badge = document.querySelector('[data-badge="true"]');
+              if (badge) { badge.click(); await sleep(300); }
+
+              // 2) Находим опцию 2025
+              const normalize = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+              const options = Array.from(document.querySelectorAll('[role="option"], [aria-selected]'));
+              const opt2025 = options.find(el => /\b2025\b/.test(normalize(el.textContent)));
+              if (!opt2025) return false;
+
+              // 3) Ищем кликабельный элемент
+              const checkbox = opt2025.querySelector('input[type="checkbox"]');
+              const target = checkbox || opt2025.querySelector('label, [role="checkbox"], .checkbox-root, .list-cell-root, span[tabindex], div[tabindex]') || opt2025;
+
+              // 4) Эмуляция клика
+              const fire = (type, el) => el && el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+              await sleep(150); fire('pointerover', target);
+              await sleep(150); fire('mouseover',  target);
+              await sleep(180); fire('pointerdown', target);
+              await sleep(150); fire('mousedown',   target);
+              await sleep(220); fire('pointerup',   target);
+              await sleep(180); fire('mouseup',     target);
+              await sleep(220);
+              return target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+            }
+            """)
+            if clicked_2025:
+                await asyncio.sleep(1200/1000)
+        except Exception:
+            pass
+
+        try:
+            await page.waitForSelector('[data-testid="construction-progress-pagination"]', {"timeout": 4000})
+        except Exception:
+            pass
+    except Exception:
+        return {"construction_stages": []}
+
+    eval_script = r"""
+    () => {
+      const toAbs = (u) => { try { return new URL(u, location.origin).href; } catch { return u || null; } };
+      const isImg = (u) => /\.(png|jpe?g|webp)(?:$|\?|#)/i.test(String(u || ''));
+      const pickFromSrcset = (srcset) => {
+        if (!srcset) return null;
+        const first = String(srcset).split(',')[0].trim().split(' ')[0];
+        return first || null;
+      };
+      const headerLike = (txt) => {
+        if (!txt) return false;
+        const s = txt.replace(/\s+/g, ' ').trim();
+        if (s.length < 5 || s.length > 160) return false;
+        const hasMarkers = /(квартал|кв\.|литер|обновлен|обновлено|год|месяц)/i.test(s);
+        const hasYear = /\b20\d{2}\b/.test(s);
+        const hasMonthYear = /[А-ЯЁ][а-яё]+,?\s*\d{4}/.test(s);
+        return hasMarkers || hasYear || hasMonthYear;
+      };
+      const collectImages = (root) => {
+        const urls = new Set();
+        root.querySelectorAll('img').forEach(img => {
+          const s1 = img.getAttribute('src');
+          const s2 = img.getAttribute('data-src') || img.getAttribute('data-lazy') || img.getAttribute('data-original');
+          const s3 = pickFromSrcset(img.getAttribute('srcset'));
+          [s1, s2, s3].filter(Boolean).map(toAbs).filter(isImg).forEach(u => urls.add(u));
+        });
+        root.querySelectorAll('source[srcset]').forEach(s => {
+          const picked = pickFromSrcset(s.getAttribute('srcset'));
+          if (picked && isImg(picked)) urls.add(toAbs(picked));
+        });
+        root.querySelectorAll('[style*=\"background\"]').forEach(el => {
+          const st = String(el.getAttribute('style') || '');
+          const m = st.match(/url\((['\"]?)(.*?)\1\)/i);
+          if (m && isImg(m[2])) urls.add(toAbs(m[2]));
+        });
+        return [...urls];
+      };
+
+      const pagination = document.querySelector('[data-testid=\"construction-progress-pagination\"]');
+      const container = pagination ? pagination.parentElement : null;
+      let upperBlocks = [];
+      if (container && pagination) {
+        let el = pagination.previousElementSibling;
+        while (el) { upperBlocks.push(el); el = el.previousElementSibling; }
+        upperBlocks.reverse();
+      }
+      if (!upperBlocks.length) {
+        const candidate = document.querySelector('[role=\"list\"] [role=\"listitem\"]')
+          ? document.querySelector('[role=\"list\"]').parentElement
+          : document.body;
+        upperBlocks = [candidate];
+      }
+
+      const seen = new Set();
+      const stages = [];
+
+      const extractStageFromBlock = (block) => {
+        const headerEl = Array.from(block.querySelectorAll('div,span,p,h1,h2,h3,h4'))
+          .find(x => headerLike((x.innerText || '').replace(/\s+/g, ' ').trim()));
+        const title = headerEl ? (headerEl.innerText || '').replace(/\s+/g, ' ').trim() : null;
+        const photos = collectImages(block).slice(0, 5);
+        if (!(title || photos.length)) return;
+        const key = `${title || ''}::${photos[0] || ''}`;
+        if (!seen.has(key)) {
+          stages.push({ title: title || 'Этап', photos });
+          seen.add(key);
+        }
+      };
+
+      upperBlocks.forEach(extractStageFromBlock);
+      const filtered = stages.filter(s => s.photos && s.photos.length);
+      return filtered;
+    }
+    """
+    # Сбор со всех страниц пагинации
+    stages_merged: List[Dict[str, Any]] = []
+    used_keys = set()
+
+    def merge_pages(stages_page: List[Dict[str, Any]]):
+        for s in stages_page or []:
+            title = s.get('title') or s.get('date') or ''
+            photos = list(s.get('photos') or [])[:5]  # ограничиваем первыми 5
+            key = f"{title}::{photos[0] if photos else ''}"
+            if key in used_keys:
+                continue
+            used_keys.add(key)
+            stages_merged.append({
+                'stage_number': len(stages_merged) + 1,
+                'date': title,
+                'photos': photos
+            })
+
+    try:
+        # Определяем количество страниц
+        pages_count = await page.evaluate("""
+        () => {
+          const pag = document.querySelector('[data-testid="construction-progress-pagination"]');
+          if (!pag) return 1;
+          const nums = Array.from(pag.querySelectorAll('button, a'))
+            .map(el => parseInt((el.textContent || '').trim(), 10))
+            .filter(n => Number.isFinite(n));
+          return Math.max(1, ...(nums.length ? nums : [1]));
+        }
+        """)
+        if not isinstance(pages_count, (int, float)) or pages_count < 1:
+            pages_count = 1
+
+        for page_index in range(1, int(pages_count) + 1):
+            try:
+                data = await page.evaluate(eval_script)
+                if isinstance(data, list):
+                    merge_pages(data)
+                elif isinstance(data, dict):
+                    merge_pages(data.get('stages') or data.get('construction_stages') or [])
+            except Exception:
+                pass
+
+            # Кликаем следующую страницу, если есть
+            if page_index < pages_count:
+                try:
+                    clicked = await page.evaluate("""
+                    (n) => {
+                      const pag = document.querySelector('[data-testid="construction-progress-pagination"]');
+                      if (!pag) return false;
+                      const btn = Array.from(pag.querySelectorAll('button, a'))
+                        .find(el => (el.textContent || '').trim() === String(n));
+                      if (btn) { btn.click(); return true; }
+                      return false;
+                    }
+                    """, page_index + 1)
+                    if clicked:
+                        await asyncio.sleep(2)
+                except Exception:
+                    pass
+
+        return {"construction_stages": stages_merged}
+    except Exception:
+        return {"construction_stages": []}
+
+
+async def process_construction_stages_domclick(stages: List[Dict[str, Any]], complex_dir: Path) -> Dict[str, Any]:
+    """Скачивает фото по этапам и возвращает структуру construction_progress с локальными путями."""
+    if not stages:
+        return {"construction_stages": []}
+    base_constr = complex_dir / "construction"
+    result_stages = []
+    async with aiohttp.ClientSession() as session:
+        for s in stages:
+            stage_num = s.get("stage_number") or (len(result_stages) + 1)
+            stage_dir = base_constr / f"stage_{stage_num}"
+            urls = (s.get("photos") or [])[:5]  # скачиваем не более 5 фото на этап
+            saved = []
+            sem = asyncio.Semaphore(5)
+            async def work(u, idx):
+                async with sem:
+                    fp = stage_dir / f"photo_{idx+1}.jpg"
+                    return await download_and_process_image(session, u, fp)
+            tasks = [work(u, i) for i, u in enumerate(urls)]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for p in results:
+                if isinstance(p, str) and p:
+                    saved.append(p)
+            result_stages.append({
+                "stage_number": stage_num,
+                "date": s.get("date") or "",
+                "photos": saved
+            })
+    return {"construction_stages": result_stages}
+
+
 def save_processed_image(image_data: bytes, file_path: Path) -> bool:
     """
     Сохраняет обработанное изображение в файл.
@@ -347,7 +580,7 @@ async def wait_offers(page) -> None:
 
 
 async def get_pages_count(page) -> int:
-    script = """
+    script = r"""
     () => {
       const nodes = Array.from(document.querySelectorAll('[data-e2e-id^="paginate-item-"]'));
       return nodes.length || 1;
@@ -532,6 +765,8 @@ async def run() -> None:
             aggregated_complex_href: str = None
             aggregated_offers: Dict[str, List[Dict[str, Any]]] = {}
             complex_gallery_images: List[str] = []  # фотографии ЖК (извлекаем один раз)
+            aggregated_hod_url: str = None  # URL страницы хода строительства
+            construction_progress_data: Dict[str, Any] = None
 
             while True:
                 if offset >= total_pages * 20:
@@ -559,6 +794,24 @@ async def run() -> None:
                             # извлекаем фотографии ЖК только при первом сборе данных
                             if not complex_gallery_images:
                                 complex_gallery_images = data.get("complexPhotos") or []
+                            # Сохраняем ссылку на страницу "О ЖК", чтобы позже перейти на /hod-stroitelstva
+                            try:
+                                about_href = await page.evaluate("""
+                                () => {
+                                  const a = document.querySelector('[data-e2e-id="complex-header-about"]');
+                                  if (a) return a.getAttribute('href') || a.href || null;
+                                  return null;
+                                }
+                                """)
+                                if about_href:
+                                    print(f"  О ЖК URL: {about_href}")
+                                    if about_href.endswith('/'):
+                                        aggregated_hod_url = about_href + 'hod-stroitelstva'
+                                    else:
+                                        aggregated_hod_url = about_href + '/hod-stroitelstva'
+                                    print(f"  Ход строительства URL: {aggregated_hod_url}")
+                            except Exception as e:
+                                print(f"Не удалось извлечь ссылку на ход строительства: {e}")
 
                         # объединяем группы офферов
                         offers = data.get("offers") or {}
@@ -674,7 +927,42 @@ async def run() -> None:
                     logger.error(f"Ошибка при обработке фотографий квартир: {e}")
                     processed_apartment_types = aggregated_offers
 
+            # После сбора всех офферов: если есть hod_url — переходим и собираем ход строительства.
+            # При ошибках (прокси/соединение) — перезапускаем браузер и пробуем ещё раз.
+            if aggregated_hod_url:
+                complex_id = get_complex_id_from_url(aggregated_complex_href or base_url)
+                complex_dir = create_complex_directory(complex_id)
+                max_attempts_hod = 3
+                attempt_hod = 0
+                while attempt_hod < max_attempts_hod and not construction_progress_data:
+                    attempt_hod += 1
+                    try:
+                        print(f"  Переход на страницу хода строительства: {aggregated_hod_url} (попытка {attempt_hod}/{max_attempts_hod})")
+                        stages_data = await extract_construction_from_domclick(page, aggregated_hod_url)
+                        if stages_data and stages_data.get('construction_stages'):
+                            print(f"  Найдено этапов: {len(stages_data['construction_stages'])}")
+                            construction_progress_data = await process_construction_stages_domclick(stages_data['construction_stages'], complex_dir)
+                            break
+                        else:
+                            print("  ⚠️ Этапы не получены со страницы хода строительства")
+                            # Пробуем перезапустить браузер на следующую попытку
+                            if attempt_hod < max_attempts_hod:
+                                try:
+                                    browser, page, _ = await restart_browser(browser, headless=False)
+                                except Exception:
+                                    pass
+                    except Exception as e:
+                        print(f"  ❌ Ошибка при сборе хода строительства: {e}")
+                        if attempt_hod < max_attempts_hod:
+                            try:
+                                browser, page, _ = await restart_browser(browser, headless=False)
+                                print("  🔄 Браузер перезапущен для повторной попытки хода строительства")
+                            except Exception as restart_error:
+                                print(f"  ⚠️ Ошибка перезапуска браузера: {restart_error}")
+
             db_item = to_db_item(complex_photos_paths, processed_apartment_types)
+            if construction_progress_data:
+                db_item.setdefault('development', {})['construction_progress'] = construction_progress_data
 
             try:
                 save_to_mongodb([db_item])

@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""
+Единый запуск: сначала parse_avito_1.py (сбор ссылок), пауза 10с, затем parse_avito_2.py (сбор карточек).
+"""
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+PYTHON = sys.executable or "python3"
+
+
+def run_script(path: Path) -> int:
+    print(f"Запуск: {path}")
+    proc = subprocess.run([PYTHON, str(path)], cwd=str(PROJECT_ROOT))
+    print(f"Завершён: {path} (код {proc.returncode})")
+    return proc.returncode
+
+
+def main() -> None:
+    first = PROJECT_ROOT / "parse_avito_1.py"
+    second = PROJECT_ROOT / "parse_avito_2.py"
+
+    code1 = run_script(first)
+    if code1 != 0:
+        print("Внимание: parse_avito_1.py завершился с ошибкой. Продолжаю запуск parse_avito_2.py.")
+
+    print("Пауза 10 секунд перед запуском второго скрипта...")
+    time.sleep(10)
+
+    code2 = run_script(second)
+    if code2 != 0:
+        print("parse_avito_2.py завершился с ошибкой.")
+
+    # Удаляем временные файлы
+    temp_files = ["catalog_links_all_pages.json", "parsing_progress.json", "failed_urls.json"]
+    for file_name in temp_files:
+        file_path = PROJECT_ROOT / file_name
+        if file_path.exists():
+            try:
+                file_path.unlink()
+                print(f"Удален временный файл: {file_name}")
+            except Exception as e:
+                print(f"Ошибка при удалении {file_name}: {e}")
+        else:
+            print(f"Файл не найден: {file_name}")
+
+
+if __name__ == "__main__":
+    main()
+

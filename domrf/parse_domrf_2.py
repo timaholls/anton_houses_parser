@@ -4,9 +4,13 @@ import json
 import random
 import os
 import sys
+import logging
+from io import BytesIO
 from pathlib import Path
 from browser_manager import setup_stealth_browser
 from db_config import get_collection, upsert_object_smart, check_duplicate_by_name
+import aiohttp
+from resize_img import ImageProcessor
 
 # Директория текущего скрипта
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -14,10 +18,61 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 # Файлы для работы
 INPUT_JSON = PROJECT_ROOT / 'domrf_houses.json'
 PROGRESS_FILE = PROJECT_ROOT / 'object_details_progress.json'
+UPLOADS_DIR = PROJECT_ROOT / 'uploads'
 
 # Настройки повторных попыток
 MAX_RETRIES = 3
 RETRY_DELAY = 5
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+image_processor = ImageProcessor(logger, max_size=(800, 600), max_kb=150)
+
+
+def create_object_directory(obj_id: str) -> Path:
+    base_dir = UPLOADS_DIR / 'objects' / str(obj_id)
+    (base_dir / 'gallery').mkdir(parents=True, exist_ok=True)
+    (base_dir / 'construction').mkdir(parents=True, exist_ok=True)
+    return base_dir
+
+
+async def download_and_process_image(session: aiohttp.ClientSession, image_url: str, file_path: Path) -> str:
+    try:
+        async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=30)) as response:
+            if response.status != 200:
+                logger.warning(f"HTTP {response.status} для {image_url}")
+                return None
+            image_bytes = await response.read()
+            processed = image_processor.process(BytesIO(image_bytes))
+            processed.seek(0)
+            data = processed.read()
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(file_path, 'wb') as f:
+                f.write(data)
+            return str(file_path.relative_to(UPLOADS_DIR)).replace('\\', '/')
+    except Exception as e:
+        logger.error(f"Ошибка скачивания/обработки {image_url}: {e}")
+        return None
+
+
+async def process_photo_list(photo_urls, target_dir: Path, prefix: str, limit: int = None):
+    if not photo_urls:
+        return []
+    if limit is not None:
+        photo_urls = list(photo_urls)[:limit]
+    results = []
+    async with aiohttp.ClientSession() as session:
+        sem = asyncio.Semaphore(5)
+        async def work(url, idx):
+            async with sem:
+                file_path = target_dir / f"{prefix}_{idx + 1}.jpg"
+                return await download_and_process_image(session, url, file_path)
+        tasks = [work(u, i) for i, u in enumerate(photo_urls)]
+        saved = await asyncio.gather(*tasks, return_exceptions=True)
+        for p in saved:
+            if isinstance(p, str) and p:
+                results.append(p)
+    return results
+
 
 
 async def check_ban_status(page):
@@ -39,6 +94,228 @@ async def check_ban_status(page):
         
         return banMessages.some(msg => bodyText.includes(msg));
     }''')
+
+
+async def extract_gallery_images(page):
+    """Собирает ссылки всех фото ЖК из верхней галереи."""
+    try:
+        images = await page.evaluate('''() => {
+            const urls = new Set();
+            try {
+                // Основной контейнер галереи карточки
+                const gallery = document.querySelector('[class*="NewBuildingCard__GalleryContainer"], [class*="GalleryWrapper"], [data-testid*="gallery"], .swiper');
+                const scope = gallery || document;
+
+                // Берем все <img> внутри области галереи
+                scope.querySelectorAll('img').forEach(img => {
+                    const src = img.getAttribute('src') || '';
+                    const dataSrc = img.getAttribute('data-src') || img.getAttribute('data-lazy') || '';
+                    [src, dataSrc].forEach(v => {
+                        if (v && !v.startsWith('data:')) urls.add(v);
+                    });
+                });
+
+                // Иногда swiper рендерит lazy-изображения в active-слайде отдельно
+                const active = document.querySelector('.swiper-slide.swiper-slide-active img');
+                if (active) {
+                    const src = active.getAttribute('src') || active.getAttribute('data-src') || active.getAttribute('data-lazy');
+                    if (src && !src.startsWith('data:')) urls.add(src);
+                }
+            } catch (e) {}
+            return Array.from(urls);
+        }''')
+        return images or []
+    except Exception as e:
+        print(f"Ошибка при извлечении галереи: {e}")
+        return []
+
+
+async def fetch_flats_api_in_browser(page, obj_id, flat_type, limit=100, offset=0):
+    """Выполняет API запрос для получения данных о квартирах (таймаут: 15 секунд)"""
+    
+    # Проверяем бан перед каждым API запросом
+    ban_detected = await check_ban_status(page)
+    
+    if ban_detected:
+        print(f"🚫 Обнаружен бан при API запросе квартир! Прерываем запрос.")
+        return "BAN_DETECTED"
+    
+    api_url = f"https://xn--80az8a.xn--d1aqf.xn--p1ai/portal-kn/api/kn/objects/{obj_id}/flats"
+    params = {
+        'flatGroupType': flat_type,
+        'limit': limit,
+        'offset': offset
+    }
+    
+    query = "&".join(f"{k}={v}" for k, v in params.items())
+    url = f"{api_url}?{query}"
+    
+    js_code = f'''
+        async () => {{
+            try {{
+                // Создаем AbortController для таймаута
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 15000); // 15 секунд
+                
+                const resp = await fetch("{url}", {{
+                    headers: {{
+                        'accept': 'application/json, text/plain, */*',
+                        'authorization': 'Basic MTpxd2U=',
+                        'sec-fetch-dest': 'empty',
+                        'sec-fetch-mode': 'cors',
+                        'sec-fetch-site': 'same-origin'
+                    }},
+                    method: 'GET',
+                    mode: 'cors',
+                    credentials: 'include',
+                    signal: controller.signal
+                }});
+                
+                clearTimeout(timeoutId); // Очищаем таймаут после успешного запроса
+                
+                if (!resp.ok) return null;
+                return await resp.json();
+            }} catch (e) {{
+                if (e.name === 'AbortError') {{
+                    console.log('Таймаут API запроса (15 секунд)');
+                }} else {{
+                    console.log('Ошибка при запросе API квартир:', e);
+                }}
+                return null;
+            }}
+        }}
+    '''
+    return await page.evaluate(js_code)
+
+
+async def get_all_flats_for_type(page, obj_id, flat_type):
+    """Получает все квартиры определенного типа с пагинацией"""
+    all_flats = []
+    offset = 0
+    limit = 100
+    page_num = 1
+    consecutive_errors = 0  # Счетчик последовательных ошибок
+    max_consecutive_errors = 3  # Максимальное количество последовательных ошибок
+
+    while True:
+        try:
+            # Проверяем бан перед каждым API запросом
+            ban_detected = await check_ban_status(page)
+            
+            if ban_detected:
+                print(f"  🚫 Обнаружен бан при получении квартир типа {flat_type} (страница {page_num}). Прерываем обработку.")
+                return {
+                    'flats': [],
+                    'total_count': 0,
+                    'consecutive_errors': 999  # Специальный код для бана
+                }
+            
+            print(f"  Получаем страницу {page_num} для {flat_type} (offset={offset}, limit={limit})")
+            flats_data = await fetch_flats_api_in_browser(page, obj_id, flat_type, limit, offset)
+            
+            # Проверяем бан после API запроса (на случай если бан появился в результате запроса)
+            ban_detected_after = await check_ban_status(page)
+            if ban_detected_after:
+                print(f"  🚫 Обнаружен бан после API запроса квартир типа {flat_type} (страница {page_num}). Прерываем обработку.")
+                return {
+                    'flats': [],
+                    'total_count': 0,
+                    'consecutive_errors': 999  # Специальный код для бана
+                }
+            
+            # Проверяем, обнаружен ли бан
+            if flats_data == "BAN_DETECTED":
+                print(f"  🚫 Обнаружен бан при получении квартир типа {flat_type}. Прерываем обработку.")
+                return {
+                    'flats': [],
+                    'total_count': 0,
+                    'consecutive_errors': 999  # Специальный код для бана
+                }
+            
+            if not flats_data:
+                consecutive_errors += 1
+                print(f"  ❌ Ошибка или пустой ответ для {flat_type} на offset={offset} (ошибка {consecutive_errors}/{max_consecutive_errors})")
+
+                if consecutive_errors >= max_consecutive_errors:
+                    print(f"  🛑 Превышено максимальное количество ошибок ({max_consecutive_errors}) для {flat_type}. Переходим к следующему типу.")
+                    break
+                else:
+                    # Пробуем увеличить offset и повторить запрос
+                    offset += limit
+                    page_num += 1
+                    await asyncio.sleep(0.5)  # Увеличенная задержка при ошибке
+                    continue
+
+            # Если получили данные, сбрасываем счетчик ошибок
+            consecutive_errors = 0
+
+            # Проверяем структуру ответа
+            if 'data' in flats_data and isinstance(flats_data['data'], list):
+                flats = flats_data['data']
+                if not flats:
+                    print(f"  ✅ Получены все квартиры типа {flat_type}. Всего: {len(all_flats)}")
+                    break
+
+                all_flats.extend(flats)
+                print(f"  📄 Получено {len(flats)} квартир, всего: {len(all_flats)}")
+
+                # Если получили меньше запрошенного количества, значит это последняя страница
+                if len(flats) < limit:
+                    print(f"  ✅ Получены все квартиры типа {flat_type}. Всего: {len(all_flats)}")
+                    break
+
+            elif isinstance(flats_data, list):
+                # Если ответ - это просто массив квартир
+                flats = flats_data
+                if not flats:
+                    print(f"  ✅ Получены все квартиры типа {flat_type}. Всего: {len(all_flats)}")
+                    break
+
+                all_flats.extend(flats)
+                print(f"  📄 Получено {len(flats)} квартир, всего: {len(all_flats)}")
+
+                # Если получили меньше запрошенного количества, значит это последняя страница
+                if len(flats) < limit:
+                    print(f"  ✅ Получены все квартиры типа {flat_type}. Всего: {len(all_flats)}")
+                    break
+            else:
+                consecutive_errors += 1
+                print(f"  ❌ Неожиданная структура ответа для {flat_type} (ошибка {consecutive_errors}/{max_consecutive_errors})")
+
+                if consecutive_errors >= max_consecutive_errors:
+                    print(f"  🛑 Превышено максимальное количество ошибок ({max_consecutive_errors}) для {flat_type}. Переходим к следующему типу.")
+                    break
+                else:
+                    offset += limit
+                    page_num += 1
+                    await asyncio.sleep(0.5)
+                    continue
+
+            # Переходим к следующей странице
+            offset += limit
+            page_num += 1
+
+            # Небольшая задержка между запросами
+            await asyncio.sleep(0.2)
+
+        except Exception as e:
+            consecutive_errors += 1
+            print(f"  ❌ Ошибка при получении страницы {page_num} для {flat_type}: {e} (ошибка {consecutive_errors}/{max_consecutive_errors})")
+
+            if consecutive_errors >= max_consecutive_errors:
+                print(f"  🛑 Превышено максимальное количество ошибок ({max_consecutive_errors}) для {flat_type}. Переходим к следующему типу.")
+                break
+            else:
+                # Пробуем продолжить с увеличенным offset
+                offset += limit
+                page_num += 1
+                await asyncio.sleep(0.5)  # Увеличенная задержка при ошибке
+
+    return {
+        'flats': all_flats,
+        'total_count': len(all_flats),
+        'consecutive_errors': consecutive_errors
+    }
 
 
 async def extract_construction_progress(page):
@@ -97,8 +374,11 @@ async def extract_construction_progress(page):
                                 }
                             });
                             
+                            // Сохраняем фото в этап
+                            stage.photos = photoUrls;
+                            
+                            // Также добавляем в общий массив для совместимости
                             if (photoUrls.length > 0) {
-                                stage.photos = photoUrls;
                                 result.photos.push(...photoUrls);
                             }
                             
@@ -135,14 +415,29 @@ async def extract_construction_progress(page):
                         }
                     }
                     
-                    // Ищем все фотографии в секции строительства
+                    // Ищем все фотографии в секции строительства и распределяем по этапам
                     const allImages = constructionSection.querySelectorAll('img[src]');
+                    const generalPhotos = [];
                     allImages.forEach(img => {
                         const src = img.src;
                         if (src && !src.includes('data:') && !result.photos.includes(src)) {
-                            result.photos.push(src);
+                            generalPhotos.push(src);
                         }
                     });
+                    
+                    // Если есть общие фото и нет фото в этапах, распределяем их
+                    if (generalPhotos.length > 0 && result.construction_stages.length > 0) {
+                        const photosPerStage = Math.ceil(generalPhotos.length / result.construction_stages.length);
+                        let photoIndex = 0;
+                        result.construction_stages.forEach(stage => {
+                            if (!stage.photos || stage.photos.length === 0) {
+                                stage.photos = generalPhotos.slice(photoIndex, photoIndex + photosPerStage);
+                                photoIndex += photosPerStage;
+                            }
+                        });
+                    }
+                    
+                    result.photos.push(...generalPhotos);
                     
                 } else {
                     console.log('Секция хода строительства не найдена');
@@ -225,6 +520,7 @@ async def extract_object_details(page, obj_id, on_partial=None):
         # Переходим на страницу объекта
         await page.goto(url, timeout=30000)
         print("Страница загружена, ожидаем появления элементов...")
+        await asyncio.sleep(10)
 
         # Проверяем бан сразу после загрузки страницы
         ban_detected = await check_ban_status(page)
@@ -415,15 +711,121 @@ async def extract_object_details(page, obj_id, on_partial=None):
             except Exception as cb_err:
                 print(f"Ошибка при промежуточном сохранении (характеристики): {cb_err}")
 
+        # Дополнительная проверка капчи перед сбором галереи
+        if await check_ban_status(page):
+            print("🚫 Капча обнаружена перед сбором галереи")
+            return "BAN_DETECTED"
+
+        # Сбор изображений из галереи ЖК
+        print(f"📷 Извлекаем фото галереи для объекта {obj_id}")
+        gallery_photos_urls = await extract_gallery_images(page)
+        if gallery_photos_urls:
+            # Сохраняем фото локально, как в domclick_2
+            base_dir = create_object_directory(str(obj_id))
+            saved_gallery = await process_photo_list(gallery_photos_urls, base_dir / 'gallery', 'photo', limit=12)
+            details['gallery_photos'] = saved_gallery
+            print(f"📸 Галерея сохранена: {len(saved_gallery)} файлов")
+        else:
+            print("ℹ️ Фото галереи не найдены")
+
+        # Получаем данные о квартирах через отдельные API запросы с пагинацией
+        flat_types = ['oneRoom', 'twoRoom', 'threeRoom', 'fourRoom']
+        flats_data = {}
+        
+        for flat_type in flat_types:
+            try:
+                # Проверяем бан перед обработкой каждого типа квартир
+                ban_detected = await check_ban_status(page)
+                
+                if ban_detected:
+                    print(f"🚫 Обнаружен бан перед обработкой квартир типа {flat_type}! Прерываем обработку объекта {obj_id}")
+                    return "BAN_DETECTED"
+                
+                print(f"🏠 Получаем ВСЕ квартиры типа {flat_type} для объекта {obj_id}")
+                flats_result = await get_all_flats_for_type(page, obj_id, flat_type)
+                
+                # Проверяем, был ли обнаружен бан
+                if flats_result.get('consecutive_errors') == 999:
+                    print(f"🚫 Обнаружен бан при получении квартир! Прерываем обработку объекта {obj_id}")
+                    return "BAN_DETECTED"
+                
+                if flats_result['total_count'] > 0:
+                    flats_data[flat_type] = {
+                        'flats': flats_result['flats'],
+                        'total_count': flats_result['total_count']
+                    }
+                    print(f"✅ Получено {flats_result['total_count']} квартир типа {flat_type}")
+                else:
+                    if flats_result.get('consecutive_errors', 0) >= 3:
+                        print(f"⚠️  Квартир типа {flat_type} не найдено (превышено количество ошибок)")
+                    else:
+                        print(f"ℹ️  Квартир типа {flat_type} не найдено")
+
+                # Проверяем бан после обработки каждого типа квартир
+                ban_detected_after_type = await check_ban_status(page)
+                if ban_detected_after_type:
+                    print(f"🚫 Обнаружен бан после обработки квартир типа {flat_type}! Прерываем обработку объекта {obj_id}")
+                    return "BAN_DETECTED"
+
+                # Промежуточное сохранение после каждого типа квартир
+                if callable(on_partial):
+                    try:
+                        details_partial = dict(details)
+                        if flats_data:
+                            details_partial['flats_data'] = dict(flats_data)
+                        on_partial(details_partial)
+                    except Exception as cb_err:
+                        print(f"Ошибка при промежуточном сохранении (квартиры {flat_type}): {cb_err}")
+
+                # Пауза между запросами разных типов квартир
+                if flat_type != 'fourRoom':  # Не делаем паузу после последнего типа
+                    await asyncio.sleep(1)
+
+            except Exception as e:
+                print(f"❌ Критическая ошибка при получении данных о {flat_type} квартирах: {e}")
+
+        # Добавляем данные о квартирах к общим данным
+        if flats_data:
+            details['flats_data'] = flats_data
+            total_flats = sum(data['total_count'] for data in flats_data.values())
+            print(f"✅ Всего получено {total_flats} квартир для объекта {obj_id}")
+        else:
+            print(f"ℹ️  Квартир не найдено для объекта {obj_id}")
+
+        # Повторная проверка капчи перед разделом хода строительства
+        if await check_ban_status(page):
+            print("🚫 Капча обнаружена перед ходом строительства")
+            return "BAN_DETECTED"
+
         # Получаем данные о ходе строительства и фотографиях
         print(f"🏗️  Извлекаем данные о ходе строительства для объекта {obj_id}")
         construction_data = await extract_construction_progress(page)
+        # Сохраняем фото хода строительства локально (если есть)
+        if construction_data:
+            base_dir = create_object_directory(str(obj_id))
+            
+            # Фото по этапам
+            stages = construction_data.get('construction_stages') or []
+            for idx, stage in enumerate(stages):
+                photos = stage.get('photos') or []
+                if not photos:
+                    continue
+                stage_num = stage.get('stage_number') or (idx + 1)
+                stage_dir = base_dir / 'construction' / f'stage_{stage_num}'
+                saved_stage = await process_photo_list(photos, stage_dir, 'photo', limit=10)
+                stage['photos'] = saved_stage
+            
+            # Убираем общий массив photos, оставляем только по этапам
+            if 'photos' in construction_data:
+                del construction_data['photos']
 
-        if construction_data['construction_stages']:
+        if construction_data and construction_data.get('construction_stages'):
             details['construction_progress'] = construction_data
             print(f"✅ Найдено {len(construction_data['construction_stages'])} этапов строительства")
-            if construction_data['photos']:
-                print(f"📸 Найдено {len(construction_data['photos'])} фотографий")
+            # Подсчитываем общее количество фото по всем этапам
+            total_photos = sum(len(stage.get('photos', [])) for stage in construction_data['construction_stages'])
+            if total_photos > 0:
+                print(f"📸 Найдено {total_photos} фотографий по этапам")
         else:
             print(f"ℹ️  Данные о ходе строительства не найдены для объекта {obj_id}")
 
@@ -438,9 +840,19 @@ async def extract_object_details(page, obj_id, on_partial=None):
         error_message = str(e)
         print(f"Ошибка при извлечении данных объекта {obj_id}: {e}")
 
-        # Проверяем, является ли это ошибкой прокси
-        if "ERR_PROXY_CONNECTION_FAILED" in error_message or "PROXY" in error_message:
-            print("🔌 Обнаружена ошибка подключения к прокси!")
+        # Проверяем, является ли это ошибкой прокси или соединения
+        connection_errors = [
+            "ERR_PROXY_CONNECTION_FAILED",
+            "ERR_CONNECTION_CLOSED", 
+            "ERR_CONNECTION_REFUSED",
+            "ERR_CONNECTION_RESET",
+            "ERR_CONNECTION_ABORTED",
+            "PROXY",
+            "CONNECTION_CLOSED"
+        ]
+        
+        if any(err in error_message for err in connection_errors):
+            print("🔌 Обнаружена ошибка подключения/прокси!")
             return "PROXY_ERROR"
 
         return None
@@ -496,7 +908,7 @@ async def process_objects():
         for i, obj in enumerate(objects_to_process):
             obj_id = obj.get('objId')
             obj_commerc_nm = obj.get('objCommercNm')
-            print(f"\\n🔄 Обрабатываем объект {i + 1}/{len(objects_to_process)} (ID: {obj_id})")
+            print(f"\n🔄 Обрабатываем объект {i + 1}/{len(objects_to_process)} (ID: {obj_id})")
 
             # Проверяем дубликат в самом начале
             if check_duplicate_by_name(collection, obj_id, obj_commerc_nm):
@@ -578,9 +990,19 @@ async def process_objects():
                 error_message = str(e)
                 print(f"Ошибка при работе с объектом {obj_id}: {e}")
 
-                # Проверяем, является ли это ошибкой прокси
-                if "ERR_PROXY_CONNECTION_FAILED" in error_message or "PROXY" in error_message:
-                    print(f"🔌 Обнаружена ошибка прокси! Перезапускаем браузер...")
+                # Проверяем, является ли это ошибкой прокси или соединения
+                connection_errors = [
+                    "ERR_PROXY_CONNECTION_FAILED",
+                    "ERR_CONNECTION_CLOSED", 
+                    "ERR_CONNECTION_REFUSED",
+                    "ERR_CONNECTION_RESET",
+                    "ERR_CONNECTION_ABORTED",
+                    "PROXY",
+                    "CONNECTION_CLOSED"
+                ]
+                
+                if any(err in error_message for err in connection_errors):
+                    print(f"🔌 Обнаружена ошибка подключения/прокси! Перезапускаем браузер...")
                     try:
                         await browser.close()
                     except:
@@ -617,7 +1039,7 @@ async def process_objects():
     # Финальное сохранение прогресса
     save_progress(list(processed_ids), list(failed_ids))
 
-    print(f"\\n✅ Обработка завершена!")
+    print(f"\n✅ Обработка завершена!")
     print(f"Успешно обработано: {len(processed_ids)}")
     print(f"Ошибок: {len(failed_ids)}")
     print(f"Всего в JSON файле: {len(objects)} объектов")

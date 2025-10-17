@@ -1,12 +1,16 @@
+#!/usr/bin/env python3
+"""
+Модуль для управления браузером
+Содержит функции для создания и настройки браузера с прокси
+"""
 import pyppeteer
 import random
 
 
 # Настройки браузера
-# EXECUTABLE_PATH = "C:\Program Files\Google\Chrome\Application\chrome.exe"
 EXECUTABLE_PATH = "/usr/bin/google-chrome-stable"
 PROXY_HOST = "192.168.0.148"
-PROXY_PORTS = [3136]
+PROXY_PORTS = [3128, 3129, 3130, 3131, 3132, 3133, 3134, 3135, 3136]
 
 
 def get_random_proxy():
@@ -27,7 +31,7 @@ async def create_browser(headless: bool = False):
         tuple: (browser, proxy_url) - Объект браузера и использованный прокси
     """
     proxy_url, port = get_random_proxy()
-    pyppeteer.launcher.DEFAULT_ARGS = []
+    
     browser = await pyppeteer.launch(
         executablePath=EXECUTABLE_PATH,
         headless=headless,
@@ -35,8 +39,16 @@ async def create_browser(headless: bool = False):
         defaultViewport={'width': 1920, 'height': 1080},
         args=[
             '--no-first-run',
-            # '--no-sandbox',
-            # f'--proxy-server={proxy_url}',
+            '--no-sandbox',
+            '--disable-web-security',
+            '--disable-features=VizDisplayCompositor',
+            '--ignore-certificate-errors',
+            '--ignore-ssl-errors',
+            '--ignore-certificate-errors-spki-list',
+            '--disable-extensions',
+            '--disable-plugins',
+            f'--proxy-server={proxy_url}',
+            '--proxy-bypass-list=<-loopback>',
         ]
     )
     return browser, proxy_url
@@ -53,6 +65,10 @@ async def create_browser_page(browser):
         page: Объект страницы браузера
     """
     page = await browser.newPage()
+    await page.setUserAgent(
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+        '(KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    )
     return page
 
 

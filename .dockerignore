@@ -1,0 +1,19 @@
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.git
+.gitignore
+*.log
+*.json
+.env
+venv
+env
+*.md
+.idea
+.vscode
+
+# Исключаем локальный профиль Chrome, чтобы не ломать контекст сборки
+domclick/chrome-profile
+chrome-profile
+

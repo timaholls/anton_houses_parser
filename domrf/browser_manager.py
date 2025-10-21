@@ -5,13 +5,14 @@ import asyncio
 import time
 import random
 import os
-
+from pyppeteer import launch
 import pyppeteer
 
 # Path to Chrome executable
 EXECUTABLE_PATH = "/usr/bin/google-chrome-stable"
 
 # Proxy configuration - using localhost
+PROXY_HOST = "192.168.0.148"
 PORTS = [3128, 3129, 3130, 3131, 3132, 3133, 3134, 3135, 3136]
 
 def get_random_user_agent():
@@ -38,29 +39,24 @@ def random_sleep(min_seconds=1, max_seconds=3):
 
 async def setup_stealth_browser():
     """Create a highly stealthed browser to avoid fingerprinting"""
-    from pyppeteer import launch
-    
+
     print("Setting up stealth Chrome browser...")
 
     # Выбираем случайный порт прокси
     proxy_port = random.choice(PORTS)
-    proxy_server = f"http://192.168.0.148:{proxy_port}"
+    proxy_server = f"http://{PROXY_HOST}:{proxy_port}"
     
     print(f"Using proxy: {proxy_server}")
 
-
+    pyppeteer.launcher.DEFAULT_ARGS = []
     # Launch browser with configuration
     browser = await launch(
         executablePath=EXECUTABLE_PATH,
         headless=False,
         args=[
             f'--proxy-server={proxy_server}',
-            '--disable-dev-shm-usage',
+            '--no-first-run',
             '--no-sandbox',
-            '--disable-setuid-sandbox',
-            f'--window-size=1920,1080',
-            '--disable-blink-features=AutomationControlled',
-            '--disable-features=IsolateOrigins,site-per-process',
         ],
         dumpio=False,
         autoClose=False,

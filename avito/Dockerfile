@@ -22,13 +22,13 @@ WORKDIR /app
 COPY req.txt /app/req.txt
 RUN pip3 install --no-cache-dir --break-system-packages -r /app/req.txt
 
-COPY domrf /app/domrf
+COPY avito /app/avito
 
 # Делаем скрипт исполняемым и добавляем парсер в Supervisor
-RUN chmod +x /app/domrf/run_parser.sh && \
+RUN chmod +x /app/avito/run_parser.sh && \
     echo "[program:parser]" >> /etc/supervisor/conf.d/supervisord.conf && \
-    echo "command=/app/domrf/run_parser.sh" >> /etc/supervisor/conf.d/supervisord.conf && \
-    echo "directory=/app/domrf" >> /etc/supervisor/conf.d/supervisord.conf && \
+    echo "command=/app/avito/run_parser.sh" >> /etc/supervisor/conf.d/supervisord.conf && \
+    echo "directory=/app/avito" >> /etc/supervisor/conf.d/supervisord.conf && \
     echo "autorestart=false" >> /etc/supervisor/conf.d/supervisord.conf && \
     echo "stdout_logfile=/dev/stdout" >> /etc/supervisor/conf.d/supervisord.conf && \
     echo "stdout_logfile_maxbytes=0" >> /etc/supervisor/conf.d/supervisord.conf && \
@@ -36,6 +36,6 @@ RUN chmod +x /app/domrf/run_parser.sh && \
     echo "stderr_logfile_maxbytes=0" >> /etc/supervisor/conf.d/supervisord.conf
 
 # Устанавливаем права на скрипт
-RUN chmod +x /app/domrf/run_parser.sh
+RUN chmod +x /app/avito/run_parser.sh
 
-WORKDIR /app/domrf
+WORKDIR /app/avito

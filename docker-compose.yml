@@ -1,0 +1,74 @@
+services:
+  avito:
+    build:
+      context: .
+      dockerfile: avito/Dockerfile
+    container_name: parser_avito
+    environment:
+      - EXECUTABLE_PATH=/usr/bin/google-chrome-stable
+      - PULSE_SERVER=unix:/run/user/1000/pulse/native
+    shm_size: '2gb'
+    volumes:
+      - ./:/app
+    ports:
+      - "5901:5901"   # VNC
+      - "6901:6901"   # noVNC (если доступен в базовом образе)
+    working_dir: /app/avito
+    command: ["python3", "main.py"]
+
+  avito_secondary:
+    build:
+      context: .
+      dockerfile: avito_secondary/Dockerfile
+    container_name: parser_avito_secondary
+    environment:
+      - EXECUTABLE_PATH=/usr/bin/google-chrome-stable
+    volumes:
+      - ./:/app
+    ports:
+      - "5902:5901"
+      - "6902:6901"
+    working_dir: /app/avito_secondary
+    command: ["python3", "main.py"]
+
+  domclick:
+    build:
+      context: .
+      dockerfile: domclick/Dockerfile
+    container_name: parser_domclick
+    environment:
+      - EXECUTABLE_PATH=/usr/bin/google-chrome-stable
+    shm_size: '2gb'
+    devices:
+      - /dev/snd
+      - /dev/dri
+    group_add:
+      - audio
+      - video
+    volumes:
+      - ./:/app
+      - /run/user/1000/pulse:/run/user/1000/pulse
+      - /dev/shm:/dev/shm
+    ports:
+      - "5903:5901"
+      - "6903:6901"
+    working_dir: /app/domclick
+    command: ["python3", "main.py"]
+
+  domrf:
+    build:
+      context: .
+      dockerfile: domrf/Dockerfile
+    container_name: parser_domrf
+    environment:
+      - EXECUTABLE_PATH=/usr/bin/google-chrome-stable
+    shm_size: '2gb'
+    volumes:
+      - ./:/app
+    ports:
+      - "5904:5901"
+      - "6904:6901"
+    working_dir: /app/domrf
+    command: ["python3", "main.py"]
+
+

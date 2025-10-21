@@ -40,6 +40,8 @@ async def create_browser(headless: bool = False):
         args=[
             '--no-first-run',
             '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
             '--disable-web-security',
             '--disable-features=VizDisplayCompositor',
             '--ignore-certificate-errors',
@@ -47,6 +49,8 @@ async def create_browser(headless: bool = False):
             '--ignore-certificate-errors-spki-list',
             '--disable-extensions',
             '--disable-plugins',
+            '--disable-gpu',
+            '--single-process',
             f'--proxy-server={proxy_url}',
             '--proxy-bypass-list=<-loopback>',
         ]

@@ -81,7 +81,7 @@ async def get_total_pages(page) -> int:
 
 async def main() -> None:
     # Запускаем браузер со случайным прокси
-    browser, proxy_url = await create_browser(headless=False)
+    browser, proxy_url = await create_browser(headless=True)
     page = await create_browser_page(browser)
     print(f"✅ Браузер запущен с прокси: {proxy_url}")
 
@@ -91,25 +91,54 @@ async def main() -> None:
     try:
         # Переходим на первую страницу для определения общего количества страниц
         max_retries = 3
+        page_loaded = False
+        
         for attempt in range(max_retries):
             print(f"Загружаем первую страницу (попытка {attempt + 1}/{max_retries})...")
-            await page.goto(base_url, waitUntil='domcontentloaded', timeout=120000)
-            await asyncio.sleep(5)
-
-            # Проверяем блокировку IP
-            is_blocked = await check_ip_blocked(page)
-            if is_blocked:
-                if attempt < max_retries - 1:
-                    print(f"🔄 IP заблокирован, перезапускаем браузер с новым прокси...")
-                    browser, page, proxy_url = await restart_browser(browser, headless=False)
-                    print(f"✅ Браузер перезапущен с прокси: {proxy_url}")
-                    await asyncio.sleep(3)
+            
+            try:
+                await page.goto(base_url, waitUntil='domcontentloaded', timeout=120000)
+                await asyncio.sleep(5)
+                
+                # Проверяем блокировку IP
+                is_blocked = await check_ip_blocked(page)
+                if is_blocked:
+                    print(f"🚫 IP заблокирован, смена прокси...")
+                    if attempt < max_retries - 1:
+                        browser, page, proxy_url = await restart_browser(browser, headless=False)
+                        print(f"✅ Браузер перезапущен с прокси: {proxy_url}")
+                        await asyncio.sleep(3)
+                        continue
+                    else:
+                        print(f"❌ IP заблокирован после {max_retries} попыток. Завершение работы.")
+                        return
                 else:
-                    print(f"❌ IP заблокирован после {max_retries} попыток. Завершение работы.")
-                    return
-            else:
-                print("✅ Доступ разрешен, продолжаем работу")
-                break
+                    print("✅ Доступ разрешен, продолжаем работу")
+                    page_loaded = True
+                    break
+                    
+            except Exception as e:
+                error_msg = str(e)
+                print(f"⚠️ Ошибка при загрузке страницы: {error_msg}")
+                
+                # Если ошибка связана с сетью или прокси - меняем прокси
+                if any(err in error_msg for err in ['ERR_', 'net::', 'timeout', 'Navigation', 'Connection']):
+                    if attempt < max_retries - 1:
+                        print(f"🔄 Сетевая ошибка, перезапускаем браузер с новым прокси...")
+                        browser, page, proxy_url = await restart_browser(browser, headless=False)
+                        print(f"✅ Браузер перезапущен с прокси: {proxy_url}")
+                        await asyncio.sleep(3)
+                        continue
+                    else:
+                        print(f"❌ Не удалось загрузить страницу после {max_retries} попыток")
+                        return
+                else:
+                    # Неизвестная ошибка - пробрасываем дальше
+                    raise
+        
+        if not page_loaded:
+            print("❌ Не удалось загрузить первую страницу")
+            return
 
         # Определяем общее количество страниц
         total_pages = await get_total_pages(page)
@@ -124,23 +153,52 @@ async def main() -> None:
                     print(f"Обрабатываем страницу {page_num}/{total_pages}: {url}")
 
                     # Пытаемся загрузить страницу с проверкой блокировки
+                    page_success = False
                     for attempt in range(3):
-                        await page.goto(url, waitUntil='domcontentloaded', timeout=120000)
-                        await asyncio.sleep(3)
+                        try:
+                            await page.goto(url, waitUntil='domcontentloaded', timeout=120000)
+                            await asyncio.sleep(3)
 
-                        # Проверяем блокировку
-                        is_blocked = await check_ip_blocked(page)
-                        if is_blocked:
-                            if attempt < 2:
-                                print(f"  🔄 IP заблокирован на странице {page_num}, перезапускаем браузер...")
-                                browser, page, proxy_url = await restart_browser(browser, headless=False)
-                                print(f"  ✅ Браузер перезапущен с прокси: {proxy_url}")
-                                await asyncio.sleep(3)
+                            # Проверяем блокировку
+                            is_blocked = await check_ip_blocked(page)
+                            if is_blocked:
+                                print(f"  🚫 IP заблокирован на странице {page_num}")
+                                if attempt < 2:
+                                    print(f"  🔄 Перезапускаем браузер с новым прокси...")
+                                    browser, page, proxy_url = await restart_browser(browser, headless=False)
+                                    print(f"  ✅ Браузер перезапущен с прокси: {proxy_url}")
+                                    await asyncio.sleep(3)
+                                    continue
+                                else:
+                                    print(f"  ❌ Пропускаем страницу {page_num} из-за блокировки")
+                                    break
                             else:
-                                print(f"  ❌ Пропускаем страницу {page_num} из-за блокировки")
+                                page_success = True
                                 break
-                        else:
-                            break
+                                
+                        except Exception as e:
+                            error_msg = str(e)
+                            print(f"  ⚠️ Ошибка при загрузке страницы {page_num}: {error_msg}")
+                            
+                            # Если ошибка связана с сетью или прокси - меняем прокси
+                            if any(err in error_msg for err in ['ERR_', 'net::', 'timeout', 'Navigation', 'Connection']):
+                                if attempt < 2:
+                                    print(f"  🔄 Сетевая ошибка, перезапускаем браузер с новым прокси...")
+                                    browser, page, proxy_url = await restart_browser(browser, headless=False)
+                                    print(f"  ✅ Браузер перезапущен с прокси: {proxy_url}")
+                                    await asyncio.sleep(3)
+                                    continue
+                                else:
+                                    print(f"  ❌ Пропускаем страницу {page_num} после 3 попыток")
+                                    break
+                            else:
+                                # Другая ошибка - пропускаем страницу
+                                print(f"  ❌ Пропускаем страницу {page_num}")
+                                break
+                    
+                    if not page_success and page_num > 1:
+                        print(f"  ⏭️ Переход к следующей странице")
+                        continue
 
                 # Извлекаем ссылки с текущей страницы
                 page_links = await extract_catalog_links(page)
@@ -152,7 +210,7 @@ async def main() -> None:
                 await asyncio.sleep(2)
 
             except Exception as e:
-                print(f"Ошибка при обработке страницы {page_num}: {e}")
+                print(f"❌ Непредвиденная ошибка при обработке страницы {page_num}: {e}")
                 continue
 
         # Выводим статистику

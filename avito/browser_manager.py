@@ -34,21 +34,13 @@ async def create_browser(headless: bool = False):
     
     browser = await pyppeteer.launch(
         executablePath=EXECUTABLE_PATH,
-        headless=headless,
+        headless=False,
         ignoreHTTPSErrors=True,
         defaultViewport={'width': 1920, 'height': 1080},
         args=[
             '--no-first-run',
             '--no-sandbox',
-            '--disable-web-security',
-            '--disable-features=VizDisplayCompositor',
-            '--ignore-certificate-errors',
-            '--ignore-ssl-errors',
-            '--ignore-certificate-errors-spki-list',
-            '--disable-extensions',
-            '--disable-plugins',
-            f'--proxy-server={proxy_url}',
-            '--proxy-bypass-list=<-loopback>',
+            # f'--proxy-server={proxy_url}',
         ]
     )
     return browser, proxy_url

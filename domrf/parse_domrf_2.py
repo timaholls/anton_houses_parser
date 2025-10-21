@@ -886,12 +886,18 @@ async def extract_object_details(page, obj_id, on_partial=None):
             "ERR_CONNECTION_REFUSED",
             "ERR_CONNECTION_RESET",
             "ERR_CONNECTION_ABORTED",
+            "ERR_TUNNEL_CONNECTION_FAILED",
+            "ERR_EMPTY_RESPONSE",
+            "net::ERR_",
             "PROXY",
-            "CONNECTION_CLOSED"
+            "CONNECTION_CLOSED",
+            "timeout",
+            "Navigation"
         ]
         
-        if any(err in error_message for err in connection_errors):
-            print("🔌 Обнаружена ошибка подключения/прокси!")
+        is_network_error = any(err in error_message for err in connection_errors)
+        if is_network_error:
+            print("🔄 Обнаружена сетевая/прокси ошибка!")
             return "PROXY_ERROR"
 
         return None

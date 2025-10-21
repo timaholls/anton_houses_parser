@@ -81,16 +81,24 @@ def save_failed_url(url, error):
 
 
 def is_proxy_error(error_message: str) -> bool:
-    """Проверяет, является ли ошибка связанной с прокси"""
+    """Проверяет, является ли ошибка связанной с прокси или сетевым подключением"""
     proxy_errors = [
         "ERR_TUNNEL_CONNECTION_FAILED",
         "ERR_PROXY_CONNECTION_FAILED",
         "ERR_CONNECTION_REFUSED",
+        "ERR_CONNECTION_CLOSED",
+        "ERR_CONNECTION_RESET",
+        "ERR_EMPTY_RESPONSE",
         "net::ERR_TUNNEL_CONNECTION_FAILED",
         "net::ERR_PROXY_CONNECTION_FAILED",
         "net::ERR_CONNECTION_REFUSED",
+        "net::ERR_CONNECTION_CLOSED",
+        "net::ERR_CONNECTION_RESET",
+        "net::ERR_EMPTY_RESPONSE",
         "timeout",
-        "connection failed"
+        "connection failed",
+        "connection closed",
+        "Navigation"
     ]
     error_lower = error_message.lower()
     return any(proxy_err.lower() in error_lower for proxy_err in proxy_errors)

@@ -39,7 +39,12 @@ async def create_browser(headless: bool = False):
         defaultViewport={'width': 1920, 'height': 1080},
         args=[
             '--no-first-run',
-            '--no-sandbox',
+            '--no-sandbox',  # Необходимо для работы в Docker
+            '--disable-setuid-sandbox',  # Дополнительная защита для Docker
+            '--disable-dev-shm-usage',  # Избегаем проблем с /dev/shm
+            '--disable-gpu',  # Отключаем GPU для стабильности
+            '--disable-software-rasterizer',
+            '--disable-extensions',
             # f'--proxy-server={proxy_url}',
         ]
     )

@@ -42,6 +42,7 @@ from browser_manager import create_browser, create_browser_page, restart_browser
 from db_manager import save_to_mongodb
 from resize_img import ImageProcessor
 from s3_service import S3Service
+from watermark_on_save import upload_with_watermark
 
 LINKS_FILE = PROJECT_ROOT / "complex_links.json"
 PROGRESS_FILE = PROJECT_ROOT / "progress_domclick_2.json"
@@ -325,7 +326,7 @@ async def process_construction_stages_domclick(stages: List[Dict[str, Any]], com
                     data = processed.read()
                     key = f"complexes/{complex_id}/construction/stage_{stage_num}/photo_{idx + 1}.jpg"
                     try:
-                        return s3.upload_bytes(data, key, content_type="image/jpeg")
+                        return upload_with_watermark(s3, data, key)
                     except Exception:
                         return None
             tasks = [work(u, i) for i, u in enumerate(urls)]
@@ -469,7 +470,7 @@ async def process_complex_photos(photo_urls: List[str], complex_id: str) -> List
                 # Загружаем в S3
                 key = f"complexes/{complex_id}/complex_photos/photo_{index + 1}.jpg"
                 try:
-                    url_public = s3.upload_bytes(data, key, content_type="image/jpeg")
+                    url_public = upload_with_watermark(s3, data, key)
                     return url_public
                 except Exception:
                     return None
@@ -530,7 +531,7 @@ async def process_apartment_photos(apartment_data: Dict[str, Any], complex_id: s
 
                 key = f"complexes/{complex_id}/apartments/{apartment_path}/photo_{index + 1}.jpg"
                 try:
-                    url_public = s3.upload_bytes(data, key, content_type="image/jpeg")
+                    url_public = upload_with_watermark(s3, data, key)
                     return url_public
                 except Exception:
                     return None

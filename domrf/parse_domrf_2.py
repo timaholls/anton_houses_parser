@@ -12,6 +12,7 @@ from db_config import get_collection, upsert_object_smart, check_duplicate_by_na
 import aiohttp
 from resize_img import ImageProcessor
 from s3_service import S3Service
+from watermark_on_save import upload_with_watermark
 
 # Директория текущего скрипта
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -48,8 +49,8 @@ async def download_and_process_image(session: aiohttp.ClientSession, image_url: 
             processed = image_processor.process(BytesIO(image_bytes))
             processed.seek(0)
             data = processed.read()
-            # Загружаем в S3 вместо локального сохранения
-            return s3.upload_bytes(data, s3_key, content_type="image/jpeg")
+            # Загружаем в S3 c добавлением водяного знака
+            return upload_with_watermark(s3, data, s3_key)
     except Exception as e:
         logger.error(f"Ошибка скачивания/обработки {image_url}: {e}")
         return None

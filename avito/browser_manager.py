@@ -6,7 +6,6 @@
 import pyppeteer
 import random
 
-
 # Настройки браузера
 EXECUTABLE_PATH = "/usr/bin/google-chrome-stable"
 PROXY_HOST = "192.168.0.148"
@@ -31,7 +30,7 @@ async def create_browser(headless: bool = False):
         tuple: (browser, proxy_url) - Объект браузера и использованный прокси
     """
     proxy_url, port = get_random_proxy()
-    
+
     browser = await pyppeteer.launch(
         executablePath=EXECUTABLE_PATH,
         headless=False,
@@ -45,7 +44,7 @@ async def create_browser(headless: bool = False):
             '--disable-gpu',  # Отключаем GPU для стабильности
             '--disable-software-rasterizer',
             '--disable-extensions',
-            # f'--proxy-server={proxy_url}',
+            f'--proxy-server={proxy_url}',
         ]
     )
     return browser, proxy_url
@@ -82,9 +81,8 @@ async def restart_browser(old_browser, headless: bool = False):
     """
     if old_browser:
         await old_browser.close()
-    
+
     new_browser, proxy_url = await create_browser(headless)
     new_page = await create_browser_page(new_browser)
-    
-    return new_browser, new_page, proxy_url
 
+    return new_browser, new_page, proxy_url

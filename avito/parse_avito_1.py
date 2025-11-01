@@ -90,7 +90,7 @@ async def main() -> None:
 
     try:
         # Переходим на первую страницу для определения общего количества страниц
-        max_retries = 3
+        max_retries = 10
         page_loaded = False
         
         for attempt in range(max_retries):
@@ -154,7 +154,7 @@ async def main() -> None:
 
                     # Пытаемся загрузить страницу с проверкой блокировки
                     page_success = False
-                    for attempt in range(3):
+                    for attempt in range(10):
                         try:
                             await page.goto(url, waitUntil='domcontentloaded', timeout=120000)
                             await asyncio.sleep(3)
@@ -163,7 +163,7 @@ async def main() -> None:
                             is_blocked = await check_ip_blocked(page)
                             if is_blocked:
                                 print(f"  🚫 IP заблокирован на странице {page_num}")
-                                if attempt < 2:
+                                if attempt < 9:
                                     print(f"  🔄 Перезапускаем браузер с новым прокси...")
                                     browser, page, proxy_url = await restart_browser(browser, headless=False)
                                     print(f"  ✅ Браузер перезапущен с прокси: {proxy_url}")
@@ -182,14 +182,14 @@ async def main() -> None:
                             
                             # Если ошибка связана с сетью или прокси - меняем прокси
                             if any(err in error_msg for err in ['ERR_', 'net::', 'timeout', 'Navigation', 'Connection']):
-                                if attempt < 2:
+                                if attempt < 9:
                                     print(f"  🔄 Сетевая ошибка, перезапускаем браузер с новым прокси...")
                                     browser, page, proxy_url = await restart_browser(browser, headless=False)
                                     print(f"  ✅ Браузер перезапущен с прокси: {proxy_url}")
                                     await asyncio.sleep(3)
                                     continue
                                 else:
-                                    print(f"  ❌ Пропускаем страницу {page_num} после 3 попыток")
+                                    print(f"  ❌ Пропускаем страницу {page_num} после 10 попыток")
                                     break
                             else:
                                 # Другая ошибка - пропускаем страницу
@@ -243,4 +243,4 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.get_event_loop().run_until_complete(main())
+    asyncio.run(main())

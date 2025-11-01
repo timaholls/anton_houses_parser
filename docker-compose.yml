@@ -14,22 +14,21 @@ services:
       - "5901:5901"   # VNC
       - "6901:6901"   # noVNC (если доступен в базовом образе)
     working_dir: /app/avito
-    command: ["python3", "main.py"]
 
-  avito_secondary:
-    build:
-      context: .
-      dockerfile: avito_secondary/Dockerfile
-    container_name: parser_avito_secondary
-    environment:
-      - EXECUTABLE_PATH=/usr/bin/google-chrome-stable
-    volumes:
-      - ./:/app
-    ports:
-      - "5902:5901"
-      - "6902:6901"
-    working_dir: /app/avito_secondary
-    command: ["python3", "main.py"]
+#  avito_secondary:
+#    build:
+#      context: .
+#      dockerfile: avito_secondary/Dockerfile
+#    container_name: parser_avito_secondary
+#    environment:
+#      - EXECUTABLE_PATH=/usr/bin/google-chrome-stable
+#    volumes:
+#      - ./:/app
+#    ports:
+#      - "5902:5901"
+#      - "6902:6901"
+#    working_dir: /app/avito_secondary
+#    command: ["python3", "main.py"]
 
   domclick:
     build:
@@ -53,7 +52,6 @@ services:
       - "5903:5901"
       - "6903:6901"
     working_dir: /app/domclick
-    command: ["python3", "main.py"]
 
   domrf:
     build:
@@ -69,6 +67,5 @@ services:
       - "5904:5901"
       - "6904:6901"
     working_dir: /app/domrf
-    command: ["python3", "main.py"]
 
 

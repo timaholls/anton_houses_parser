@@ -11,9 +11,9 @@ except Exception:
     cairosvg = None
 
 try:
-    from .s3_service import S3Service  # type: ignore
+    from s3_service import S3Service  # type: ignore
 except Exception as exc:  # pragma: no cover
-    raise RuntimeError("Не найден domrf.s3_service.S3Service") from exc
+    raise RuntimeError("Не найден s3_service.S3Service") from exc
 
 logger = logging.getLogger("domrf.watermark_on_save")
 

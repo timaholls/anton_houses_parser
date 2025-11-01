@@ -12,9 +12,11 @@ PYTHON = sys.executable or "python3"
 
 
 def run_script(path: Path) -> int:
-    print(f"Запуск: {path}")
-    proc = subprocess.run([PYTHON, str(path)], cwd=str(PROJECT_ROOT))
-    print(f"Завершён: {path} (код {proc.returncode})")
+    print(f"Запуск: {path}", flush=True)
+    # Добавляем -u для отключения буферизации Python
+    # stdout=None и stderr=None означают прямой вывод в консоль
+    proc = subprocess.run([PYTHON, "-u", str(path)], cwd=str(PROJECT_ROOT))
+    print(f"Завершён: {path} (код {proc.returncode})", flush=True)
     return proc.returncode
 
 
@@ -24,14 +26,14 @@ def main() -> None:
 
     code1 = run_script(first)
     if code1 != 0:
-        print("Внимание: parse_avito_1.py завершился с ошибкой. Продолжаю запуск parse_avito_2.py.")
+        print("Внимание: parse_avito_1.py завершился с ошибкой. Продолжаю запуск parse_avito_2.py.", flush=True)
 
-    print("Пауза 10 секунд перед запуском второго скрипта...")
+    print("\nПауза 10 секунд перед запуском второго скрипта...", flush=True)
     time.sleep(10)
 
     code2 = run_script(second)
     if code2 != 0:
-        print("parse_avito_2.py завершился с ошибкой.")
+        print("parse_avito_2.py завершился с ошибкой.", flush=True)
 
     # Удаляем временные файлы
     temp_files = ["catalog_links_all_pages.json", "parsing_progress.json", "failed_urls.json"]
@@ -40,11 +42,11 @@ def main() -> None:
         if file_path.exists():
             try:
                 file_path.unlink()
-                print(f"Удален временный файл: {file_name}")
+                print(f"Удален временный файл: {file_name}", flush=True)
             except Exception as e:
-                print(f"Ошибка при удалении {file_name}: {e}")
+                print(f"Ошибка при удалении {file_name}: {e}", flush=True)
         else:
-            print(f"Файл не найден: {file_name}")
+            print(f"Файл не найден: {file_name}", flush=True)
 
 
 if __name__ == "__main__":

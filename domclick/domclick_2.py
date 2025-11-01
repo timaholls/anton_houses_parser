@@ -655,7 +655,7 @@ async def get_pages_count(page) -> int:
 
 
 async def collect_page_items_grouped(page) -> Dict[str, Any]:
-    script = """
+    script = r"""
     () => {
       const toAbs = (u) => { try { return new URL(u, location.origin).href; } catch { return u || null; } };
       const isPngJpg = (u) => /\.(png|jpe?g)(?:$|\?|#)/i.test(String(u || ''));
@@ -768,8 +768,30 @@ async def run() -> None:
         except Exception:
             pass
 
-    browser, _ = await create_browser(headless=False)
-    page = await create_browser_page(browser)
+    # Создаем браузер с повторными попытками в случае ошибки прокси
+    browser = None
+    page = None
+    max_init_attempts = 5
+    
+    for init_attempt in range(max_init_attempts):
+        try:
+            browser, proxy_url = await create_browser(headless=False)
+            print(f"Попытка {init_attempt + 1}/{max_init_attempts}: Создан браузер с прокси {proxy_url}")
+            page = await create_browser_page(browser)
+            print("✓ Браузер и страница успешно инициализированы")
+            break
+        except Exception as init_error:
+            print(f"✗ Ошибка инициализации браузера (попытка {init_attempt + 1}/{max_init_attempts}): {init_error}")
+            if browser:
+                try:
+                    await browser.close()
+                except:
+                    pass
+            if init_attempt < max_init_attempts - 1:
+                await asyncio.sleep(2)
+            else:
+                print("Не удалось создать браузер после всех попыток. Завершение работы.")
+                return
 
     try:
         while url_index < len(urls):
@@ -1048,4 +1070,4 @@ async def run() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.get_event_loop().run_until_complete(run())
+    asyncio.run(run())

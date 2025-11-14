@@ -736,7 +736,11 @@ async def save_url_data_to_mongodb():
     """Сохраняет данные текущего URL в MongoDB"""
     try:
         # Проверяем, есть ли данные для сохранения
-        if not CURRENT_URL_DATA.get('apartment_types') and CURRENT_URL_DATA.get('total_apartments', 0) == 0:
+        # Сохраняем даже если нет квартир, но есть информация о ЖК
+        has_apartments = CURRENT_URL_DATA.get('apartment_types') and CURRENT_URL_DATA.get('total_apartments', 0) > 0
+        has_development = CURRENT_URL_DATA.get('development') and CURRENT_URL_DATA.get('development').get('url')
+        
+        if not has_apartments and not has_development:
             print("⚠️ Нет новых данных для сохранения")
             return
         
@@ -746,7 +750,12 @@ async def save_url_data_to_mongodb():
         # Сохраняем одну запись для всего URL
         success = save_to_mongodb([CURRENT_URL_DATA])
         if success:
-            print(f"💾 Сохранено: {CURRENT_URL_DATA.get('total_apartments', 0)} квартир в MongoDB")
+            apartments_count = CURRENT_URL_DATA.get('total_apartments', 0)
+            development_name = CURRENT_URL_DATA.get('development', {}).get('name', 'Неизвестно')
+            if apartments_count > 0:
+                print(f"💾 Сохранено: {apartments_count} квартир в MongoDB (ЖК: {development_name})")
+            else:
+                print(f"💾 Сохранена информация о ЖК в MongoDB (без квартир): {development_name}")
             # Полностью очищаем данные для следующего URL
             CURRENT_URL_DATA.clear()
         else:

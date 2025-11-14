@@ -6,9 +6,10 @@
 import os
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List
+from typing import Dict, List, Optional
 from pymongo import MongoClient
 from dotenv import load_dotenv
+from urllib.parse import urlparse
 
 # Директория текущего скрипта
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -31,6 +32,71 @@ def get_mongo_client():
     except Exception as e:
         print(f"❌ Ошибка подключения к MongoDB: {e}")
         return None
+
+
+def normalize_complex_url(url: str) -> str:
+    """
+    Нормализует URL комплекса, приводя к единому формату.
+    Всегда использует ufa.domclick.ru для единообразия.
+    """
+    if not url:
+        return url
+    
+    try:
+        parsed = urlparse(url)
+        path_parts = parsed.path.split('/')
+        if 'complexes' in path_parts:
+            complex_index = path_parts.index('complexes')
+            if complex_index + 1 < len(path_parts):
+                slug = path_parts[complex_index + 1]
+                # Всегда используем ufa.domclick.ru
+                return f"https://ufa.domclick.ru/complexes/{slug}"
+    except Exception:
+        pass
+    
+    return url
+
+
+def find_existing_record(collection, url: str):
+    """
+    Ищет существующую запись по URL, учитывая разные варианты доменов.
+    Ищет по нормализованному URL и по slug комплекса.
+    """
+    if not url:
+        return None
+    
+    # Нормализуем URL
+    normalized_url = normalize_complex_url(url)
+    
+    # Сначала ищем по точному совпадению нормализованного URL
+    existing = collection.find_one({'url': normalized_url})
+    if existing:
+        return existing
+    
+    # Если не нашли, ищем по исходному URL
+    if url != normalized_url:
+        existing = collection.find_one({'url': url})
+        if existing:
+            return existing
+    
+    # Если не нашли, пытаемся найти по slug комплекса
+    try:
+        parsed = urlparse(normalized_url)
+        path_parts = parsed.path.split('/')
+        if 'complexes' in path_parts:
+            complex_index = path_parts.index('complexes')
+            if complex_index + 1 < len(path_parts):
+                slug = path_parts[complex_index + 1]
+                # Ищем записи, где URL содержит этот slug
+                existing = collection.find_one({
+                    'url': {'$regex': f'/complexes/{slug}'}
+                })
+                if existing:
+                    return existing
+    except Exception:
+        pass
+    
+    return None
 
 
 def compare_and_merge_data(existing_data, new_data):
@@ -109,30 +175,50 @@ def save_to_mongodb(data):
                 print("⚠️ URL не найден в данных, пропускаем")
                 continue
             
-            # Ищем существующую запись по URL
-            existing = collection.find_one({'url': url})
+            # Нормализуем URL перед сохранением
+            normalized_url = normalize_complex_url(url)
+            item['url'] = normalized_url  # Сохраняем нормализованный URL
+            
+            # Ищем существующую запись по URL (с учетом разных вариантов доменов)
+            existing = find_existing_record(collection, normalized_url)
             
             if existing:
-                print(f"📝 Найдена существующая запись для: {url}")
+                existing_url = existing.get('url', '')
+                print(f"📝 Найдена существующая запись для: {existing_url} (искали: {normalized_url})")
+                
+                # Если URL в существующей записи отличается, обновляем его на нормализованный
+                if existing_url != normalized_url:
+                    print(f"  Обновляю URL с {existing_url} на {normalized_url}")
                 
                 # Сравниваем и объединяем данные
                 merged_data, changes = compare_and_merge_data(existing, item)
+                
+                # Убеждаемся, что URL нормализован
+                merged_data['url'] = normalized_url
                 
                 if changes:
                     print(f"🔄 Обнаружены изменения:")
                     for change in changes:
                         print(f"   - {change}")
                     
-                    # Обновляем запись
+                    # Обновляем запись по _id существующей записи
                     collection.update_one(
-                        {'url': url},
+                        {'_id': existing['_id']},
                         {'$set': merged_data}
                     )
                     print(f"✅ Запись обновлена")
                 else:
-                    print(f"ℹ️ Нет изменений, запись не обновлена")
+                    # Даже если нет изменений, обновляем URL если он отличается
+                    if existing_url != normalized_url:
+                        collection.update_one(
+                            {'_id': existing['_id']},
+                            {'$set': {'url': normalized_url}}
+                        )
+                        print(f"✅ URL обновлен на нормализованный")
+                    else:
+                        print(f"ℹ️ Нет изменений, запись не обновлена")
             else:
-                print(f"➕ Создаем новую запись для: {url}")
+                print(f"➕ Создаем новую запись для: {normalized_url}")
                 # Удаляем _id если он есть
                 if '_id' in item:
                     del item['_id']

@@ -5,10 +5,15 @@
 """
 
 import os
+import sys
+
+import re
 from datetime import datetime, timezone
 from bson import ObjectId
 from pymongo import MongoClient
 
+
+# Настройка Django
 
 def get_mongo_connection():
     """Получить подключение к MongoDB"""
@@ -17,6 +22,38 @@ def get_mongo_connection():
     client = MongoClient(MONGO_URI)
     db = client[DB_NAME]
     return db
+
+
+def parse_apartment_info(title):
+    """
+    Парсит title и извлекает площадь и этаж
+    Формат: '3-к. квартира, 58,9 м², 14/27 эт.'
+    Возвращает: (площадь: float, этаж: int) или (None, None) если не удалось распарсить
+    """
+    if not title:
+        return None, None
+
+    area = None
+    floor = None
+
+    # Парсим площадь: ищем паттерн типа "58,9 м²" или "58.9 м²"
+    area_match = re.search(r'(\d+[,.]?\d*)\s*м²', title)
+    if area_match:
+        area_str = area_match.group(1).replace(',', '.')
+        try:
+            area = float(area_str)
+        except ValueError:
+            pass
+
+    # Парсим этаж: ищем паттерн типа "14/27 эт." или "14/27"
+    floor_match = re.search(r'(\d+)/(\d+)\s*эт', title)
+    if floor_match:
+        try:
+            floor = int(floor_match.group(1))
+        except ValueError:
+            pass
+
+    return area, floor
 
 
 def normalize_datetime(dt):
@@ -262,6 +299,11 @@ def rebuild_unified_record(unified_record):
         avito_apt_types = avito_record.get('apartment_types', {})
         domclick_apt_types = domclick_record.get('apartment_types', {})
 
+        print(f"\n🔍 === ОБЪЕДИНЕНИЕ APARTMENT_TYPES ===")
+        print(f"📊 Типы в Avito: {list(avito_apt_types.keys())}")
+        print(f"📊 Типы в DomClick: {list(domclick_apt_types.keys())}")
+        print(f"📊 Старые типы в unified: {list(old_apt_types.keys())}")
+
         # Маппинг старых названий на новые упрощенные (ТОЧНО КАК В save_manual_match)
         name_mapping = {
             # Студия
@@ -295,57 +337,98 @@ def rebuild_unified_record(unified_record):
             # Упрощаем название типа
             simplified_name = name_mapping.get(dc_type_name, dc_type_name)
 
+            print(f"\n  🔄 Обрабатываем тип DomClick: '{dc_type_name}' → упрощенное: '{simplified_name}'")
+
             # Пропускаем если уже обработали этот упрощенный тип
             if simplified_name in processed_types:
+                print(f"    ⏭️ Пропущено: тип '{simplified_name}' уже обработан ранее")
                 continue
             processed_types.add(simplified_name)
 
             # Получаем квартиры из DomClick
             dc_apartments = dc_type_data.get('apartments', [])
+            print(f"    📦 Квартир в DomClick: {len(dc_apartments)}")
+
             if not dc_apartments:
+                print(f"    ⚠️ Пропущено: нет квартир в DomClick для типа '{dc_type_name}'")
                 continue
 
-            # Ищем соответствующий тип в Avito
-            avito_apartments = []
-            for avito_type_name, avito_data in avito_apt_types.items():
-                avito_simplified = name_mapping.get(avito_type_name, avito_type_name)
-                if avito_simplified == simplified_name:
-                    avito_apartments = avito_data.get('apartments', [])
-                    break
-
-            # ИЗМЕНЕНО: Добавляем тип только если есть данные в Avito
-            if not avito_apartments:
-                continue  # Пропускаем тип, если нет данных в Avito
-
-            # Объединяем: количество квартир = количество квартир в DomClick
+            # Берем ВСЕ данные из DomClick без сопоставления с Avito
             combined_apartments = []
+            skipped_no_photos = 0
+
+            print(f"    🔗 Берем все квартиры из DomClick:")
+
+            # Парсим все квартиры из DomClick для логирования
+            print(f"    📋 Парсинг квартир из DomClick:")
+            for idx, dc_apt in enumerate(dc_apartments):
+                dc_title = dc_apt.get('title', '')
+                dc_area, dc_floor = parse_apartment_info(dc_title)
+                # Проверяем оба поля для совместимости
+                has_photos = len(dc_apt.get('photos') or dc_apt.get('images') or []) > 0
+                print(f"      [{idx}] '{dc_title[:60] if dc_title else 'нет title'}...'")
+                print(
+                    f"          Площадь: {dc_area if dc_area else 'не распознана'}, Этаж: {dc_floor if dc_floor else 'не распознан'}, Фото: {'есть' if has_photos else 'нет'}")
 
             for i, dc_apt in enumerate(dc_apartments):
                 # Получаем ВСЕ фото этой квартиры из DomClick как МАССИВ
-                apartment_photos = dc_apt.get('photos', [])
+                # Проверяем оба поля для совместимости
+                apartment_photos = dc_apt.get('photos') or dc_apt.get('images') or []
+                
+                # Логируем структуру квартиры для отладки
+                if i == 0:  # Логируем только первую квартиру для примера
+                    print(f"      📋 Структура квартиры DomClick (пример):")
+                    print(f"         Ключи: {list(dc_apt.keys())}")
+                    print(f"         title: {dc_apt.get('title', 'НЕТ')}")
+                    print(f"         photos: {len(apartment_photos)} элементов")
+                    if apartment_photos:
+                        print(f"         Первое фото: {apartment_photos[0][:80]}...")
 
                 # Если фото нет - пропускаем эту квартиру
                 if not apartment_photos:
+                    skipped_no_photos += 1
+                    print(f"\n      ⚠️ Квартира DomClick #{i + 1}: пропущена (нет фото)")
                     continue
 
-                # Берем соответствующую квартиру из Avito (циклически)
-                avito_apt = avito_apartments[i % len(avito_apartments)]
+                # Парсим информацию о квартире из DomClick
+                dc_title = dc_apt.get('title', '')
+                dc_area, dc_floor = parse_apartment_info(dc_title)
 
+                print(f"\n      ✅ Квартира DomClick #{i + 1}:")
+                print(f"         Title: '{dc_title[:60]}...'")
+                print(
+                    f"         📐 Парсинг: Площадь={dc_area if dc_area else 'не распознана'}, Этаж={dc_floor if dc_floor else 'не распознан'}")
+                print(f"         📸 Фото: {len(apartment_photos)} шт.")
+
+                # Берем ВСЕ данные из DomClick
                 combined_apartments.append({
-                    'title': avito_apt.get('title', ''),
-                    'price': avito_apt.get('price', ''),
-                    'pricePerSquare': avito_apt.get('pricePerSquare', ''),
-                    'completionDate': avito_apt.get('completionDate', ''),
-                    'url': avito_apt.get('urlPath', ''),
-                    'image': apartment_photos  # МАССИВ всех фото этой планировки!
+                    'title': dc_title,  # Title из DomClick
+                    'area': str(dc_area) if dc_area else '',  # Площадь из DomClick как строка
+                    'totalArea': dc_area if dc_area else None,  # Площадь из DomClick как число (для совместимости)
+                    'price': dc_apt.get('price', ''),  # Цена из DomClick (если есть)
+                    'pricePerSquare': dc_apt.get('pricePerSquare', ''),  # Цена за м² из DomClick (если есть)
+                    'completionDate': dc_apt.get('completionDate', ''),  # Дата сдачи из DomClick (если есть)
+                    'url': dc_apt.get('url', '') or dc_apt.get('urlPath', ''),  # URL из DomClick (если есть)
+                    'image': apartment_photos  # МАССИВ всех фото этой планировки из DomClick!
                 })
 
-            # Добавляем в результат только если есть квартиры с фото И данными из Avito
+            if skipped_no_photos > 0:
+                print(f"\n    ⚠️ Пропущено квартир без фото: {skipped_no_photos}")
+
+            # Добавляем в результат все квартиры из DomClick с фото
             if combined_apartments:
                 new_record['apartment_types'][simplified_name] = {
                     'apartments': combined_apartments
                 }
                 new_apt_counts[simplified_name] = len(combined_apartments)
+                print(f"    ✅ Тип '{simplified_name}' добавлен: {len(combined_apartments)} квартир")
+            else:
+                print(f"    ⚠️ Тип '{simplified_name}' не добавлен: нет квартир с фото")
+
+        print(f"\n📊 === ИТОГИ ОБЪЕДИНЕНИЯ ===")
+        print(f"📦 Старое количество квартир: {total_old_apartments}")
+        print(f"📦 Новое количество квартир: {sum(new_apt_counts.values())}")
+        print(f"📋 Новые типы: {list(new_apt_counts.keys())}")
 
         # Логируем изменения в количестве квартир
         total_new_apartments = sum(new_apt_counts.values())
@@ -414,10 +497,10 @@ def main():
             unified_timestamp = normalize_datetime(unified_timestamp)
 
             # Сравниваем даты
-            if source_timestamp <= unified_timestamp:
-                print(f"✅ Запись актуальна (исходные: {source_timestamp}, объединенная: {unified_timestamp})")
-                skipped_count += 1
-                continue
+            # if source_timestamp <= unified_timestamp:
+            #     print(f"✅ Запись актуальна (исходные: {source_timestamp}, объединенная: {unified_timestamp})")
+            #     skipped_count += 1
+            #     continue
 
             print(f"🔄 Обновляем (исходные: {source_timestamp}, объединенная: {unified_timestamp})")
 

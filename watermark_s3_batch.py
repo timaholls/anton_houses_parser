@@ -1,10 +1,14 @@
 import io
 import logging
-import sys
 from pathlib import Path
 from typing import Iterable, List, Optional
 
 from PIL import Image
+
+try:
+    import cairosvg
+except Exception:
+    cairosvg = None
 
 # Пытаемся импортировать S3Service из доступных модулей проекта
 try:
@@ -15,16 +19,69 @@ except Exception:
     except Exception as exc:
         raise RuntimeError("Не удалось импортировать S3Service из domrf/domclick") from exc
 
-# Используем функции наложения водяного знака из тестового скрипта
-try:
-    from watermark_test import apply_watermark
-except Exception as exc:  # pragma: no cover
-    raise RuntimeError(
-        "Не удалось импортировать apply_watermark из watermark_test.py"
-    ) from exc
-
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+
+
+def ensure_svg_to_png(svg_path: Path, scale_width_px: int) -> Image.Image:
+    if cairosvg is None:
+        raise RuntimeError(
+            "Требуется пакет 'cairosvg'. Установите зависимости из req.txt или выполните: pip install cairosvg"
+        )
+
+    with open(svg_path, "rb") as f:
+        svg_bytes = f.read()
+
+    png_bytes = cairosvg.svg2png(bytestring=svg_bytes, output_width=scale_width_px)
+    return Image.open(io.BytesIO(png_bytes)).convert("RGBA")
+
+
+def apply_watermark(
+        photo_path: Path,
+        svg_logo_path: Path,
+        output_path: Path,
+        relative_width: float = 0.2,
+        opacity: float = 0.6,
+        margin_px: int = 24,
+        position: str = "bottom-right",
+        full_coverage: bool = False,
+):
+    base = Image.open(photo_path).convert("RGBA")
+
+    if full_coverage:
+        target_size = int(min(base.width, base.height) * 0.8)
+        target_logo_width = max(1, target_size)
+        if opacity == 0.6:
+            opacity = 0.15
+        position = "center"
+    else:
+        target_logo_width = max(1, int(base.width * relative_width))
+
+    logo_rgba = ensure_svg_to_png(svg_logo_path, target_logo_width)
+
+    if opacity < 0:
+        opacity = 0
+    if opacity > 1:
+        opacity = 1
+    if logo_rgba.mode != "RGBA":
+        logo_rgba = logo_rgba.convert("RGBA")
+    r, g, b, a = logo_rgba.split()
+    a = a.point(lambda p: int(p * opacity))
+    logo_rgba = Image.merge("RGBA", (r, g, b, a))
+
+    if position == "center":
+        x = (base.width - logo_rgba.width) // 2
+        y = (base.height - logo_rgba.height) // 2
+    else:
+        x = base.width - logo_rgba.width - margin_px
+        y = base.height - logo_rgba.height - margin_px
+
+    composed = base.copy()
+    composed.alpha_composite(logo_rgba, dest=(max(0, x), max(0, y)))
+
+    rgb = composed.convert("RGB")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    rgb.save(output_path, format="JPEG", quality=92)
 
 
 def is_image_key(key: str, exts: Optional[Iterable[str]] = None) -> bool:
@@ -64,28 +121,12 @@ def process_key(
     s3: S3Service,
     key: str,
     logo_path: Path,
-    dest_prefix: Optional[str],
-    overwrite: bool,
-    rel_width: float,
-    opacity: float,
-    margin: int,
-    position: str,
-    full: bool,
 ) -> Optional[str]:
     if not is_image_key(key):
         return None
 
-    # Куда сохраняем
-    if dest_prefix:
-        filename = key.split("/")[-1]
-        out_key = f"{dest_prefix.rstrip('/')}/{filename}".lstrip("/")
-    else:
-        if not overwrite:
-            # По умолчанию пишем в тот же путь с постфиксом
-            p = Path(key)
-            out_key = str(p.with_stem(p.stem + "_wm"))
-        else:
-            out_key = key
+    # Перезаписываем исходный файл
+    out_key = key
 
     # Скачиваем, применяем водяной знак, загружаем обратно
     obj = s3.s3_client.get_object(Bucket=s3.bucket_name, Key=key)
@@ -103,11 +144,11 @@ def process_key(
         photo_path=tmp_in,
         svg_logo_path=logo_path,
         output_path=tmp_out,
-        relative_width=rel_width,
-        opacity=opacity,
-        margin_px=margin,
-        position=position,
-        full_coverage=full,
+        relative_width=0.2,
+        opacity=0.6,
+        margin_px=24,
+        position="center",
+        full_coverage=True,
     )
 
     with open(tmp_out, "rb") as f:
@@ -124,26 +165,15 @@ def main():
         format="%(asctime)s %(levelname)s %(name)s - %(message)s",
     )
     logger = logging.getLogger("watermark_s3")
-    # Настройки по умолчанию: как watermark_test.py --full
+    
     s3 = S3Service()
-    prefix = ""  # без аргументов: обработать все ключи в бакете
+    prefix = ""  # обработать все ключи в бакете
     logo_path = Path("/home/art/PycharmProjects/anton_houses_parser/pic-logo.svg")
-    rel_width = 0.2
-    opacity = 0.15
-    margin = 24
-    position = "center"
-    full = True
-    dest_prefix: Optional[str] = None
-    overwrite = True  # перезаписываем исходные файлы
 
     logger.info(
-        "Запуск пакетной обработки: bucket=%s, prefix='%s', overwrite=%s, full=%s, position=%s, opacity=%.2f, logo=%s",
+        "Запуск пакетной обработки: bucket=%s, prefix='%s', logo=%s",
         s3.bucket_name,
         prefix,
-        overwrite,
-        full,
-        position,
-        opacity,
         str(logo_path),
     )
 
@@ -166,13 +196,6 @@ def main():
                 s3=s3,
                 key=key,
                 logo_path=logo_path,
-                dest_prefix=dest_prefix,
-                overwrite=overwrite,
-                rel_width=rel_width,
-                opacity=opacity,
-                margin=margin,
-                position=position,
-                full=full,
             )
             if out_key:
                 processed += 1

@@ -1,5 +1,6 @@
 import io
 import logging
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -86,26 +87,41 @@ def _watermark_bytes(
     position: str = "center",
     margin: int = 24,
 ) -> bytes:
-    with Image.open(io.BytesIO(image_bytes)) as img:
-        tmp_in = Path("/tmp/domclick_wm_in.jpg")
-        tmp_out = Path("/tmp/domclick_wm_out.jpg")
-        tmp_in.parent.mkdir(parents=True, exist_ok=True)
-        fmt = "PNG" if img.mode in ("RGBA", "LA") else "JPEG"
-        img.convert("RGBA" if fmt == "PNG" else "RGB").save(tmp_in, format=fmt)
+    # Используем временную директорию, которая работает на всех платформах
+    temp_dir = Path(tempfile.gettempdir())
+    tmp_in = temp_dir / "domclick_wm_in.jpg"
+    tmp_out = temp_dir / "domclick_wm_out.jpg"
+    
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            fmt = "PNG" if img.mode in ("RGBA", "LA") else "JPEG"
+            img.convert("RGBA" if fmt == "PNG" else "RGB").save(tmp_in, format=fmt)
 
-    apply_watermark(
-        photo_path=tmp_in,
-        svg_logo_path=logo_path,
-        output_path=tmp_out,
-        relative_width=rel_width,
-        opacity=opacity,
-        margin_px=margin,
-        position=position,
-        full_coverage=full,
-    )
+        apply_watermark(
+            photo_path=tmp_in,
+            svg_logo_path=logo_path,
+            output_path=tmp_out,
+            relative_width=rel_width,
+            opacity=opacity,
+            margin_px=margin,
+            position=position,
+            full_coverage=full,
+        )
 
-    with open(tmp_out, "rb") as f:
-        return f.read()
+        with open(tmp_out, "rb") as f:
+            return f.read()
+    finally:
+        # Удаляем временные файлы после использования
+        try:
+            if tmp_in.exists():
+                tmp_in.unlink()
+        except Exception:
+            pass
+        try:
+            if tmp_out.exists():
+                tmp_out.unlink()
+        except Exception:
+            pass
 
 
 def upload_with_watermark(
@@ -118,19 +134,29 @@ def upload_with_watermark(
     """Накладывает водяной знак и загружает в S3 тем же ключом.
 
     По умолчанию логотип берётся из корня проекта: pic-logo.svg
+    Если cairosvg недоступен, загружает изображение без водяного знака.
     """
     if logo_path is None:
         logo_path = Path("pic-logo.svg")
 
-    logger.info("Добавление водяного знака и загрузка в S3: key=%s", key)
-    watermarked = _watermark_bytes(
-        image_bytes=image_bytes,
-        logo_path=logo_path,
-        full=True,
-        opacity=0.15,
-        rel_width=0.2,
-        position="center",
-    )
-    return s3.upload_bytes(watermarked, key=key, content_type=overwrite_content_type)
+    # Проверяем доступность cairosvg
+    if cairosvg is None:
+        logger.warning("cairosvg недоступен (требуется системная библиотека Cairo). Загружаю изображение без водяного знака: key=%s", key)
+        return s3.upload_bytes(image_bytes, key=key, content_type=overwrite_content_type)
+
+    try:
+        logger.info("Добавление водяного знака и загрузка в S3: key=%s", key)
+        watermarked = _watermark_bytes(
+            image_bytes=image_bytes,
+            logo_path=logo_path,
+            full=True,
+            opacity=0.15,
+            rel_width=0.2,
+            position="center",
+        )
+        return s3.upload_bytes(watermarked, key=key, content_type=overwrite_content_type)
+    except Exception as e:
+        logger.warning("Ошибка при наложении водяного знака (%s). Загружаю изображение без водяного знака: key=%s", e, key)
+        return s3.upload_bytes(image_bytes, key=key, content_type=overwrite_content_type)
 
 

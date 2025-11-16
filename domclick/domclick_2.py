@@ -21,7 +21,7 @@ import json
 import os
 import base64
 import logging
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from pathlib import Path
 import aiohttp
 from io import BytesIO
@@ -127,46 +127,9 @@ async def extract_construction_from_domclick(page, hod_url: str) -> Dict[str, An
     """Переходит на страницу хода строительства Domclick и извлекает даты и ссылки на фото со всех страниц пагинации.
     Возвращает { construction_stages: [{stage_number, date, photos: [urls<=5]}] }.
     """
-    print(f"    🔍 Начинаю извлечение хода строительства с URL: {hod_url}")
-    script = """
-    async (targetUrl) => {
-      try {
-        // Навигация на страницу "Ход строительства"
-        if (location.href !== targetUrl) {
-          history.scrollRestoration = 'manual';
-        }
-      } catch (e) {}
-      return null;
-    }
-    """
     try:
-        # Переходим на страницу хода строительства
-        print(f"    📍 Переход на страницу: {hod_url}")
         await page.goto(hod_url, timeout=120000, waitUntil='networkidle0')
         await asyncio.sleep(3)
-        
-        # Проверяем, что страница загрузилась
-        page_title = await page.evaluate("() => document.title")
-        page_url = await page.evaluate("() => location.href")
-        print(f"    📄 Заголовок страницы: {page_title}")
-        print(f"    🔗 Текущий URL: {page_url}")
-        
-        # Проверяем наличие элементов на странице
-        page_info = await page.evaluate("""
-        () => {
-          const pagination = document.querySelector('[data-testid="construction-progress-pagination"]');
-          const images = document.querySelectorAll('img');
-          const stages = document.querySelectorAll('[role="listitem"], .stage, [class*="stage"]');
-          return {
-            hasPagination: !!pagination,
-            imagesCount: images.length,
-            stagesCount: stages.length,
-            bodyText: document.body ? document.body.innerText.substring(0, 200) : ''
-          };
-        }
-        """)
-        print(f"    🔍 Информация о странице: пагинация={page_info.get('hasPagination')}, изображений={page_info.get('imagesCount')}, этапов={page_info.get('stagesCount')}")
-        print(f"    📝 Начало текста страницы: {page_info.get('bodyText', '')[:100]}...")
 
         # Клик по бейджу и по чекбоксу "2025" в ОДНОМ evaluate (с задержками)
         try:
@@ -318,27 +281,17 @@ async def extract_construction_from_domclick(page, hod_url: str) -> Dict[str, An
         if not isinstance(pages_count, (int, float)) or pages_count < 1:
             pages_count = 1
 
-        print(f"    📊 Количество страниц пагинации: {pages_count}")
-        
         for page_index in range(1, int(pages_count) + 1):
             try:
-                print(f"    📄 Обработка страницы {page_index}/{pages_count}...")
                 data = await page.evaluate(eval_script)
-                print(f"    📦 Данные со страницы {page_index}: тип={type(data)}, длина={len(data) if isinstance(data, (list, dict)) else 'N/A'}")
                 
                 if isinstance(data, list):
-                    print(f"    ✅ Найдено этапов на странице {page_index}: {len(data)}")
                     merge_pages(data)
                 elif isinstance(data, dict):
                     stages_list = data.get('stages') or data.get('construction_stages') or []
-                    print(f"    ✅ Найдено этапов на странице {page_index}: {len(stages_list)}")
                     merge_pages(stages_list)
-                else:
-                    print(f"    ⚠️ Неожиданный формат данных на странице {page_index}: {type(data)}")
-            except Exception as e:
-                print(f"    ❌ Ошибка при обработке страницы {page_index}: {e}")
-                import traceback
-                traceback.print_exc()
+            except Exception:
+                pass
 
             # Кликаем следующую страницу, если есть
             if page_index < pages_count:
@@ -358,18 +311,8 @@ async def extract_construction_from_domclick(page, hod_url: str) -> Dict[str, An
                 except Exception:
                     pass
 
-        print(f"    ✅ Всего собрано этапов: {len(stages_merged)}")
-        if stages_merged:
-            print(f"    📸 Примеры фото из этапов:")
-            for idx, stage in enumerate(stages_merged[:3], 1):
-                photos_count = len(stage.get('photos', []))
-                print(f"      Этап {idx}: дата={stage.get('date', 'N/A')}, фото={photos_count}")
-        
         return {"construction_stages": stages_merged}
-    except Exception as e:
-        print(f"    ❌ Ошибка при извлечении хода строительства: {e}")
-        import traceback
-        traceback.print_exc()
+    except Exception:
         return {"construction_stages": []}
 
 
@@ -377,7 +320,13 @@ async def process_construction_stages_domclick(stages: List[Dict[str, Any]], com
     """Скачивает фото по этапам и загружает в S3, возвращает структуру construction_progress с URL."""
     if not stages:
         return {"construction_stages": []}
-    s3 = S3Service()
+    try:
+        s3 = S3Service()
+    except Exception as s3_error:
+        logger.error(f"Ошибка инициализации S3Service для хода строительства: {s3_error}")
+        import traceback
+        logger.error(f"Полный traceback:\n{traceback.format_exc()}")
+        return {"construction_stages": []}
     result_stages = []
     async with aiohttp.ClientSession() as session:
         for s in stages:
@@ -403,7 +352,8 @@ async def process_construction_stages_domclick(stages: List[Dict[str, Any]], com
                     data = processed.read()
                     key = f"complexes/{complex_id}/construction/stage_{stage_num}/photo_{idx + 1}.jpg"
                     try:
-                        return upload_with_watermark(s3, data, key)
+                        url_public = upload_with_watermark(s3, data, key)
+                        return url_public
                     except Exception:
                         return None
             tasks = [work(u, i) for i, u in enumerate(urls)]
@@ -536,46 +486,28 @@ async def fetch_offers_api(page, api_params: Dict[str, Any], offset: int, max_re
     
     for attempt in range(1, max_retries + 1):
         try:
-            print(api_url)
-
             result = await page.evaluate(script, api_url)
             if isinstance(result, dict):
                 if 'error' in result:
-                    logger.warning(f"API запрос offset={offset} вернул ошибку (попытка {attempt}/{max_retries}): {result['error']}")
                     if attempt < max_retries:
-                        await asyncio.sleep(2 * attempt)  # Экспоненциальная задержка: 2, 4, 6 секунд
+                        await asyncio.sleep(2 * attempt)
                         continue
                     return None
                 
-                # Логируем структуру ответа для отладки
-                logger.info(f"API ответ offset={offset}: ключи верхнего уровня: {list(result.keys())}")
-                if 'result' in result:
-                    logger.info(f"  Найден ключ 'result', его ключи: {list(result['result'].keys()) if isinstance(result['result'], dict) else 'не словарь'}")
-                
                 # Проверяем, есть ли обертка 'result'
                 if 'result' in result and isinstance(result['result'], dict):
-                    # Данные обернуты в 'result'
                     actual_data = result['result']
-                    logger.info(f"  Используем данные из result, ключи: {list(actual_data.keys())}")
-                    # Сохраняем также total из верхнего уровня, если он там есть
                     if 'total' in result:
                         actual_data['total'] = result['total']
-                        logger.info(f"  Найден total в верхнем уровне: {result['total']}")
                     return actual_data
                 
-                # Успешный ответ без обертки
-                logger.info(f"  Используем данные напрямую, ключи: {list(result.keys())}")
-                if 'total' in result:
-                    logger.info(f"  Найден total: {result['total']}")
                 return result
             else:
-                logger.warning(f"Неожиданный формат ответа API offset={offset} (попытка {attempt}/{max_retries})")
                 if attempt < max_retries:
                     await asyncio.sleep(2 * attempt)
                     continue
                 return None
         except Exception as e:
-            logger.warning(f"Ошибка выполнения fetch запроса offset={offset} (попытка {attempt}/{max_retries}): {e}")
             if attempt < max_retries:
                 await asyncio.sleep(2 * attempt)
                 continue
@@ -629,7 +561,13 @@ async def process_complex_photos(photo_urls: List[str], complex_id: str) -> List
         return []
 
     processed_photos = []
-    s3 = S3Service()
+    try:
+        s3 = S3Service()
+    except Exception as s3_error:
+        logger.error(f"Ошибка инициализации S3Service для фотографий ЖК: {s3_error}")
+        import traceback
+        logger.error(f"Полный traceback:\n{traceback.format_exc()}")
+        return []
 
     async with aiohttp.ClientSession() as session:
         # Обрабатываем до 5 фотографий параллельно
@@ -670,7 +608,6 @@ async def process_complex_photos(photo_urls: List[str], complex_id: str) -> List
             if isinstance(result, str) and result:
                 processed_photos.append(result)
 
-    logger.info(f"Обработано {len(processed_photos)} из {len(photo_urls)} фотографий ЖК")
     return processed_photos
 
 
@@ -679,21 +616,39 @@ async def process_apartment_photos(apartment_data: Dict[str, Any], complex_id: s
     Обрабатывает фотографии для одной квартиры и загружает в S3.
     Возвращает данные с URL к файлам.
     """
-    if not apartment_data.get("images"):
-        return {
-            "offer": apartment_data.get("offer"),
-            "photos": []
-        }
-
-    image_urls = apartment_data["images"]
+    image_urls = apartment_data.get("images")
+    if not image_urls:
+        image_urls = apartment_data.get("photos")
+    
     if not image_urls:
         return {
             "offer": apartment_data.get("offer"),
-            "photos": []
+            "photos": [],
+            "area": apartment_data.get("area", ""),
+            "totalArea": apartment_data.get("totalArea"),
+            "price": apartment_data.get("price", ""),
+            "pricePerSquare": apartment_data.get("pricePerSquare", ""),
+            "completionDate": apartment_data.get("completionDate", ""),
+            "url": apartment_data.get("url", "")
         }
 
     processed_images = []
-    s3 = S3Service()
+    try:
+        s3 = S3Service()
+    except Exception as s3_error:
+        logger.error(f"Ошибка инициализации S3Service для фотографий квартир: {s3_error}")
+        import traceback
+        logger.error(f"Полный traceback:\n{traceback.format_exc()}")
+        return {
+            "offer": apartment_data.get("offer"),
+            "photos": [],
+            "area": apartment_data.get("area", ""),
+            "totalArea": apartment_data.get("totalArea"),
+            "price": apartment_data.get("price", ""),
+            "pricePerSquare": apartment_data.get("pricePerSquare", ""),
+            "completionDate": apartment_data.get("completionDate", ""),
+            "url": apartment_data.get("url", "")
+        }
 
     async with aiohttp.ClientSession() as session:
         # Обрабатываем до 3 фотографий параллельно для квартир
@@ -727,18 +682,20 @@ async def process_apartment_photos(apartment_data: Dict[str, Any], complex_id: s
         tasks = [process_single_photo(url, i) for i, url in enumerate(image_urls[:3])]  # максимум 3 фото на квартиру
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        for i, result in enumerate(results):
+        for result in results:
             if isinstance(result, str) and result:
                 processed_images.append(result)
-            elif isinstance(result, Exception):
-                logger.error(f"Ошибка обработки фото {i + 1}: {result}")
-            else:
-                logger.warning(f"Фото {i + 1} не обработано: {type(result)}")
 
     # Возвращаем данные квартиры с URL к файлам
     result = {
         "offer": apartment_data.get("offer"),
-        "photos": processed_images
+        "photos": processed_images,
+        "area": apartment_data.get("area", ""),
+        "totalArea": apartment_data.get("totalArea"),
+        "price": apartment_data.get("price", ""),
+        "pricePerSquare": apartment_data.get("pricePerSquare", ""),
+        "completionDate": apartment_data.get("completionDate", ""),
+        "url": apartment_data.get("url", "")
     }
     return result
 
@@ -804,19 +761,7 @@ def process_api_response(api_data: Dict[str, Any]) -> Dict[str, Any]:
     Обрабатывает ответ API и преобразует в нужный формат.
     Возвращает словарь с offers (группированные по комнатам), address, complexName, complexHref.
     """
-    logger.info(f"Обработка ответа API: ключи верхнего уровня: {list(api_data.keys()) if api_data else 'None'}")
-    
-    if not api_data:
-        logger.warning("  api_data пустой или None")
-        return {
-            'offers': {},
-            'address': None,
-            'complexName': None,
-            'complexHref': None
-        }
-    
-    if 'items' not in api_data:
-        logger.warning(f"  Ключ 'items' не найден в api_data. Доступные ключи: {list(api_data.keys())}")
+    if not api_data or 'items' not in api_data:
         return {
             'offers': {},
             'address': None,
@@ -838,6 +783,9 @@ def process_api_response(api_data: Dict[str, Any]) -> Dict[str, Any]:
     first_item = items[0]
     
     address = first_item.get('address', {}).get('displayName')
+    location_data = first_item.get('location', {}) or {}
+    latitude = location_data.get('lat')
+    longitude = location_data.get('lon')
     
     complex_data = first_item.get('complex', {})
     complex_name = complex_data.get('name')
@@ -858,13 +806,11 @@ def process_api_response(api_data: Dict[str, Any]) -> Dict[str, Any]:
     
     for idx, item in enumerate(items):
         if not isinstance(item, dict):
-            logger.warning(f"  ⚠️ Пропущен элемент {idx+1}/{total_items}: не является словарем (тип: {type(item).__name__})")
             skipped_count += 1
             continue
             
         general_info = item.get('generalInfo', {})
         if not general_info:
-            logger.warning(f"  ⚠️ Пропущен элемент {idx+1}/{total_items}: отсутствует generalInfo. Ключи элемента: {list(item.keys())[:10]}")
             skipped_count += 1
             continue
             
@@ -909,9 +855,78 @@ def process_api_response(api_data: Dict[str, Any]) -> Dict[str, Any]:
                     full_url = f"https://img.dmclk.ru/{photo_url}"
                 image_urls.append(full_url)
         
+        # Извлекаем дополнительные поля из API
+        # Цена
+        price_info = item.get('price', {})
+        if isinstance(price_info, dict):
+            price = price_info.get('value') or price_info.get('text') or price_info.get('formatted')
+        elif price_info:
+            price = price_info
+        else:
+            price = None
+        price_str = str(price) if price else ''
+        
+        # Цена за м² - вычисляем из price / area
+        price_per_square = None
+        if price and area:
+            try:
+                price_num = float(price) if isinstance(price, (int, float, str)) else None
+                area_num = float(area) if isinstance(area, (int, float, str)) else None
+                if price_num and area_num and area_num > 0:
+                    price_per_square = round(price_num / area_num, 2)
+            except (ValueError, TypeError):
+                pass
+        
+        # Если не удалось вычислить, пробуем найти в API
+        if not price_per_square:
+            price_per_square_info = item.get('pricePerSquare', {})
+            if isinstance(price_per_square_info, dict):
+                price_per_square = price_per_square_info.get('value') or price_per_square_info.get('text') or price_per_square_info.get('formatted')
+            elif price_per_square_info:
+                price_per_square = price_per_square_info
+        
+        price_per_square_str = str(price_per_square) if price_per_square else ''
+        
+        # Дата сдачи - формируем из complex.building.endBuildQuarter и endBuildYear
+        completion_date_str = ''
+        complex_data = item.get('complex', {})
+        building_data = complex_data.get('building', {}) if isinstance(complex_data, dict) else {}
+        
+        if building_data:
+            end_build_quarter = building_data.get('endBuildQuarter')
+            end_build_year = building_data.get('endBuildYear')
+            
+            if end_build_quarter and end_build_year:
+                completion_date_str = f"{end_build_quarter} квартал {end_build_year}"
+            elif end_build_year:
+                completion_date_str = str(end_build_year)
+        
+        # Если не удалось сформировать из building, пробуем найти в API
+        if not completion_date_str:
+            completion_date = item.get('completionDate', '')
+            if isinstance(completion_date, dict):
+                completion_date = completion_date.get('value', '') or completion_date.get('text', '') or completion_date.get('formatted', '')
+            completion_date_str = str(completion_date) if completion_date else ''
+        
+        # URL объявления - используем path из API
+        apartment_url = item.get('path', '') or item.get('url', '') or item.get('urlPath', '') or item.get('href', '')
+        if apartment_url and not apartment_url.startswith('http'):
+            apartment_url = f"https://ufa.domclick.ru{apartment_url}" if apartment_url.startswith('/') else f"https://ufa.domclick.ru/{apartment_url}"
+        apartment_url_str = apartment_url if apartment_url else ''
+        
+        # Площадь как строка и число
+        area_str = str(area) if area else ''
+        total_area = float(area) if area else None
+        
         card = {
             'offer': title,
-            'photos': image_urls  # Используем 'photos' для совместимости с MongoDB схемой
+            'photos': image_urls,  # Используем 'photos' для совместимости с MongoDB схемой
+            'area': area_str,  # Площадь как строка
+            'totalArea': total_area,  # Площадь как число
+            'price': price_str,  # Цена
+            'pricePerSquare': price_per_square_str,  # Цена за м²
+            'completionDate': completion_date_str,  # Дата сдачи
+            'url': apartment_url_str  # URL объявления
         }
         
         if room_key not in offers:
@@ -919,16 +934,16 @@ def process_api_response(api_data: Dict[str, Any]) -> Dict[str, Any]:
         offers[room_key].append(card)
     
     processed_count = sum(len(cards) for cards in offers.values())
-    logger.info(f"  Итого: получено={total_items}, обработано={processed_count}, пропущено={skipped_count}, групп={len(offers)}")
-    
     if skipped_count > 0:
-        logger.warning(f"  ⚠️ ВНИМАНИЕ: Пропущено {skipped_count} из {total_items} элементов!")
+        logger.warning(f"  Пропущено {skipped_count} из {total_items} элементов")
     
     return {
         'offers': offers,
         'address': address,
         'complexName': complex_name,
-        'complexHref': complex_href
+        'complexHref': complex_href,
+        'latitude': latitude,
+        'longitude': longitude,
     }
 
 
@@ -975,7 +990,7 @@ async def run() -> None:
     browser = None
     page = None
     max_init_attempts = 5
-    
+
     for init_attempt in range(max_init_attempts):
         try:
             browser, proxy_url = await create_browser(headless=False)
@@ -998,513 +1013,567 @@ async def run() -> None:
 
     try:
         while url_index < len(urls):
-            base_url = urls[url_index]
-            print(f"→ URL [{url_index + 1}/{len(urls)}]: {base_url}")
-
-            if offset % 20 != 0:
-                offset = (offset // 20) * 20
-
-            # Извлекаем параметры из URL
-            api_params = extract_url_params(base_url)
-            if not api_params:
-                print(f"Не удалось извлечь параметры из URL: {base_url}. Пропускаю.")
-                url_index += 1
-                offset = 0
-                save_progress(url_index, offset, str(PROGRESS_FILE))
-                continue
-
-            # Открываем страницу из файла для установки cookies и контекста браузера
-            # Используем waitUntil: 'networkidle0' чтобы дождаться полной загрузки
             try:
-                print(f"  Открываю страницу для инициализации контекста: {base_url}")
-                await page.goto(base_url, timeout=120000, waitUntil='networkidle0')
-                
-                # Дополнительно ждем, пока страница полностью загрузится
-                await page.waitForFunction(
-                    "() => document.readyState === 'complete'",
-                    {"timeout": 30000}
-                )
-                
-                # Ждем еще немного, чтобы все скрипты выполнились
-                await asyncio.sleep(3)
-                print(f"  Страница загружена, контекст готов")
-            except Exception as e:
-                print(f"  Предупреждение: не удалось открыть страницу: {e}")
-                # Пробуем продолжить без открытия страницы
+                base_url = urls[url_index]
+                print(f"→ URL [{url_index + 1}/{len(urls)}]: {base_url}")
 
-            # Делаем первый запрос для определения общего количества результатов
-            attempts = 0
-            first_api_response = None
-            while attempts < 3:
+                if offset % 20 != 0:
+                    offset = (offset // 20) * 20
+
+                # Извлекаем параметры из URL
+                api_params = extract_url_params(base_url)
+                if not api_params:
+                    print(f"Не удалось извлечь параметры из URL: {base_url}. Пропускаю.")
+                    url_index += 1
+                    offset = 0
+                    save_progress(url_index, offset, str(PROGRESS_FILE))
+                    continue
+
+                # Открываем страницу из файла для установки cookies и контекста браузера
                 try:
-                    # Проверяем, что страница еще жива и полностью загружена
-                    try:
-                        ready_state = await page.evaluate("() => document.readyState")
-                        if ready_state != 'complete':
-                            print(f"  Страница еще не загружена (readyState: {ready_state}), жду...")
-                            await page.waitForFunction(
-                                "() => document.readyState === 'complete'",
-                                {"timeout": 30000}
-                            )
-                            await asyncio.sleep(2)
-                    except Exception:
-                        # Если контекст уничтожен, переоткрываем страницу
-                        print(f"  Контекст уничтожен, переоткрываю страницу...")
-                        await page.goto(base_url, timeout=120000, waitUntil='networkidle0')
-                        await page.waitForFunction(
-                            "() => document.readyState === 'complete'",
-                            {"timeout": 30000}
-                        )
-                        await asyncio.sleep(3)
-                    
-                    print(f"  Запрос данных offset=0...")
-                    first_api_response = await fetch_offers_api(page, api_params, 0, max_retries=3)
-                    if first_api_response and 'items' in first_api_response:
-                        print(f"  ✓ Успешно получено данных для offset=0")
-                        break
-                    attempts += 1
-                    if attempts < 3:
-                        print(f"  Повторная попытка через 2 секунды...")
-                        await asyncio.sleep(2)
-                except Exception as e:
-                    attempts += 1
-                    print(f"Ошибка при первом API запросе: {e} (попытка {attempts}/3)")
-                    if attempts >= 3:
-                        try:
-                            browser, page, _ = await restart_browser(browser, headless=False)
-                            attempts = 0
-                        except Exception as restart_error:
-                            print(f"  Ошибка при перезапуске браузера: {restart_error}")
-                            break
-                    else:
-                        await asyncio.sleep(2)
-
-            if not first_api_response:
-                print(f"Не удалось получить данные из API для URL: {base_url}. Пропускаю.")
-                url_index += 1
-                offset = 0
-                save_progress(url_index, offset, str(PROGRESS_FILE))
-                continue
-
-            # Определяем общее количество результатов и страниц
-            total = first_api_response.get('total', 0)
-            items_count = len(first_api_response.get('items', []))
-            limit = int(api_params.get('limit', 20))
-            
-            logger.info(f"  Ответ API: total={total}, items в ответе={items_count}, limit={limit}")
-            
-            # Если total=0, но есть items, используем количество items как индикатор
-            if total == 0 and items_count > 0:
-                logger.warning(f"  total=0, но найдено {items_count} items. Будем запрашивать пока есть данные.")
-                # Устанавливаем большое значение, чтобы цикл работал, но будем проверять наличие данных
-                total = items_count + 1  # Чтобы цикл выполнился хотя бы один раз
-            
-            total_pages = max(1, (total + limit - 1) // limit) if total > 0 else 1
-            print(f"  Всего результатов: {total}, items в первом ответе: {items_count}, страниц: {total_pages}")
-
-            # Обрабатываем первый ответ
-            first_data = process_api_response(first_api_response)
-            aggregated_address = first_data.get('address')
-            aggregated_complex_name = first_data.get('complexName')
-            aggregated_complex_href = first_data.get('complexHref')
-            aggregated_offers = first_data.get('offers', {})
-            
-            # Логируем первый batch
-            log_apartment_photo_parsing(aggregated_offers, base_url=base_url, offset=0)
-
-            # Обрабатываем остальные страницы
-            current_offset = limit
-            # Если total был установлен искусственно (из-за total=0), используем другой подход
-            if total == items_count + 1:
-                # Запрашиваем пока есть данные
-                while True:
-                    print(f"  Запрос данных offset={current_offset}...")
-                    api_response = await fetch_offers_api(page, api_params, current_offset, max_retries=3)
-                    
-                    if api_response and 'items' in api_response:
-                        response_items = api_response.get('items', [])
-                        if not response_items:
-                            print(f"  Нет данных для offset={current_offset}, завершаю обработку")
-                            break
-                        
-                        data = process_api_response(api_response)
-                        offers = data.get('offers', {})
-                        log_apartment_photo_parsing(offers, base_url=base_url, offset=current_offset)
-                        
-                        # Объединяем группы офферов
-                        for group, cards in offers.items():
-                            if group not in aggregated_offers:
-                                aggregated_offers[group] = []
-                            aggregated_offers[group].extend(cards)
-                        
-                        offset = current_offset + limit
-                        save_progress(url_index, offset, str(PROGRESS_FILE))
-                        print(f"  ✓ Успешно получено {len(response_items)} элементов для offset={current_offset}")
-                        
-                        # Если получили меньше limit элементов, значит это последняя страница
-                        if len(response_items) < limit:
-                            print(f"  Получено меньше limit ({len(response_items)} < {limit}), это последняя страница")
-                            break
-                    else:
-                        print(f"  ✗ Не удалось получить данные для offset={current_offset}, завершаю обработку")
-                        break
-                    
-                    # Пауза между запросами
-                    await asyncio.sleep(3)  # Пауза 3 секунды между запросами
-                    current_offset += limit
-            else:
-                # Обычный случай: total известен
-                while current_offset < total:
-                    print(f"  Запрос данных offset={current_offset}...")
-                    api_response = await fetch_offers_api(page, api_params, current_offset, max_retries=3)
-                    
-                    if api_response and 'items' in api_response:
-                        data = process_api_response(api_response)
-                        offers = data.get('offers', {})
-                        log_apartment_photo_parsing(offers, base_url=base_url, offset=current_offset)
-                        
-                        # Объединяем группы офферов
-                        for group, cards in offers.items():
-                            if group not in aggregated_offers:
-                                aggregated_offers[group] = []
-                            aggregated_offers[group].extend(cards)
-                        
-                        offset = current_offset + limit
-                        save_progress(url_index, offset, str(PROGRESS_FILE))
-                        print(f"  ✓ Успешно получено данных для offset={current_offset}")
-                    else:
-                        print(f"  ✗ Не удалось получить данные для offset={current_offset}, пропускаю")
-                    
-                    # Пауза между запросами (кроме последнего)
-                    if current_offset + limit < total:
-                        await asyncio.sleep(3)  # Пауза 3 секунды между запросами
-                    
-                    current_offset += limit
-
-            # Для получения фотографий ЖК и ссылки на ход строительства нужно открыть страницу комплекса
-            complex_gallery_images: List[str] = []
-            aggregated_hod_url: str = None
-            construction_progress_data: Dict[str, Any] = None
-            
-            if aggregated_complex_href:
-                try:
-                    print(f"  Открываю страницу комплекса для получения фотографий ЖК: {aggregated_complex_href}")
-                    await page.goto(aggregated_complex_href, timeout=120000)
+                    await page.goto(base_url, timeout=120000, waitUntil='networkidle0')
+                    await page.waitForFunction(
+                        "() => document.readyState === 'complete'",
+                        {"timeout": 30000}
+                    )
                     await asyncio.sleep(3)
-                    
-                    # Извлекаем фотографии ЖК из галереи
+                except Exception:
+                    pass  # Пробуем продолжить без открытия страницы
+
+                # Делаем первый запрос для определения общего количества результатов
+                attempts = 0
+                browser_restart_count = 0
+                max_browser_restarts = 2  # Максимум 2 перезапуска браузера на URL
+                first_api_response = None
+
+                while attempts < 3 and browser_restart_count < max_browser_restarts:
                     try:
-                        complex_photos_data = await page.evaluate("""
-                        () => {
-                          const complexPhotos = [];
-                          
-                          // Пробуем разные селекторы для галереи
-                          let galleryContainer = document.querySelector('[data-e2e-id="complex-header-gallery"]');
-                          if (!galleryContainer) {
-                            // Пробуем альтернативные селекторы
-                            galleryContainer = document.querySelector('[data-e2e-id*="gallery"]');
-                          }
-                          if (!galleryContainer) {
-                            // Пробуем найти по классу
-                            galleryContainer = document.querySelector('.gallery, [class*="gallery"], [class*="Gallery"]');
-                          }
-                          
-                          console.log('Gallery container found:', !!galleryContainer);
-                          
-                          if (galleryContainer) {
-                            // Пробуем разные селекторы для изображений
-                            let imageElements = galleryContainer.querySelectorAll('[data-e2e-id^="complex-header-gallery-image__"]');
-                            if (imageElements.length === 0) {
-                              // Пробуем найти все изображения в контейнере
-                              imageElements = galleryContainer.querySelectorAll('img');
+                        # Проверяем, что браузер и страница еще живы
+                        page_closed = False
+                        try:
+                            if page and not page.isClosed():
+                                ready_state = await page.evaluate("() => document.readyState")
+                                if ready_state != 'complete':
+                                    await page.waitForFunction(
+                                        "() => document.readyState === 'complete'",
+                                        {"timeout": 30000}
+                                    )
+                                    await asyncio.sleep(2)
+                            else:
+                                page_closed = True
+                        except Exception as check_error:
+                            error_str = str(check_error).lower()
+                            if 'session closed' in error_str or 'target closed' in error_str or 'page closed' in error_str:
+                                page_closed = True
+                            else:
+                                try:
+                                    await page.goto(base_url, timeout=120000, waitUntil='networkidle0')
+                                    await page.waitForFunction(
+                                        "() => document.readyState === 'complete'",
+                                        {"timeout": 30000}
+                                    )
+                                    await asyncio.sleep(3)
+                                except Exception:
+                                    page_closed = True
+
+                        # Если страница закрыта, перезапускаем браузер
+                        if page_closed:
+                            if browser_restart_count >= max_browser_restarts:
+                                print(f"  ✗ Достигнут лимит перезапусков браузера, пропускаю URL")
+                                try:
+                                    if browser:
+                                        await browser.close()
+                                except Exception:
+                                    pass
+                                first_api_response = None
+                                break
+
+                            browser_restart_count += 1
+                            try:
+                                browser, page, _ = await restart_browser(browser, headless=False)
+                                await page.goto(base_url, timeout=120000, waitUntil='networkidle0')
+                                await page.waitForFunction(
+                                    "() => document.readyState === 'complete'",
+                                    {"timeout": 30000}
+                                )
+                                await asyncio.sleep(3)
+                                attempts = 0
+                            except Exception as restart_error:
+                                if browser_restart_count >= max_browser_restarts:
+                                    print(f"  ✗ Достигнут лимит перезапусков браузера, пропускаю URL")
+                                    try:
+                                        if browser:
+                                            await browser.close()
+                                    except Exception:
+                                        pass
+                                    first_api_response = None
+                                    break
+                                await asyncio.sleep(5)
+                                continue
+
+                        first_api_response = await fetch_offers_api(page, api_params, 0, max_retries=3)
+                        if first_api_response and 'items' in first_api_response:
+                            break
+                        attempts += 1
+                        if attempts < 3:
+                            await asyncio.sleep(2)
+                    except Exception as e:
+                        error_str = str(e).lower()
+                        attempts += 1
+
+                        # Если ошибка связана с закрытой сессией, перезапускаем браузер
+                        if 'session closed' in error_str or 'target closed' in error_str or 'page closed' in error_str:
+                            if browser_restart_count >= max_browser_restarts:
+                                print(f"  ✗ Достигнут лимит перезапусков браузера, пропускаю URL")
+                                try:
+                                    if browser:
+                                        await browser.close()
+                                except Exception:
+                                    pass
+                                first_api_response = None
+                                break
+
+                            browser_restart_count += 1
+                            try:
+                                browser, page, _ = await restart_browser(browser, headless=False)
+                                await page.goto(base_url, timeout=120000, waitUntil='networkidle0')
+                                await page.waitForFunction(
+                                    "() => document.readyState === 'complete'",
+                                    {"timeout": 30000}
+                                )
+                                await asyncio.sleep(3)
+                                attempts = 0
+                            except Exception:
+                                if browser_restart_count >= max_browser_restarts:
+                                    print(f"  ✗ Достигнут лимит перезапусков браузера, пропускаю URL")
+                                    try:
+                                        if browser:
+                                            await browser.close()
+                                    except Exception:
+                                        pass
+                                    first_api_response = None
+                                    break
+                                await asyncio.sleep(5)
+                                continue
+                        elif attempts >= 3:
+                            if browser_restart_count < max_browser_restarts:
+                                browser_restart_count += 1
+                                try:
+                                    browser, page, _ = await restart_browser(browser, headless=False)
+                                    attempts = 0
+                                except Exception:
+                                    try:
+                                        if browser:
+                                            await browser.close()
+                                    except Exception:
+                                        pass
+                                    first_api_response = None
+                                    break
+                            else:
+                                try:
+                                    if browser:
+                                        await browser.close()
+                                except Exception:
+                                    pass
+                                first_api_response = None
+                                break
+                        else:
+                            await asyncio.sleep(2)
+
+                if not first_api_response:
+                    print(f"  ✗ Не удалось получить данные из API, пропускаю URL")
+                    url_index += 1
+                    offset = 0
+                    save_progress(url_index, offset, str(PROGRESS_FILE))
+                    continue
+
+                # Определяем общее количество результатов и страниц
+                total = first_api_response.get('total', 0)
+                items_count = len(first_api_response.get('items', []))
+                limit = int(api_params.get('limit', 20))
+
+                # Если total=0, но есть items, используем количество items как индикатор
+                if total == 0 and items_count > 0:
+                    total = items_count + 1  # Чтобы цикл выполнился хотя бы один раз
+
+                total_pages = max(1, (total + limit - 1) // limit) if total > 0 else 1
+                print(f"  Всего результатов: {total}, страниц: {total_pages}")
+
+                # Обрабатываем первый ответ
+                first_data = process_api_response(first_api_response)
+                aggregated_address = first_data.get('address')
+                aggregated_complex_name = first_data.get('complexName')
+                aggregated_complex_href = first_data.get('complexHref')
+                aggregated_latitude = first_data.get('latitude')
+                aggregated_longitude = first_data.get('longitude')
+                aggregated_offers = first_data.get('offers', {})
+
+                # Обрабатываем остальные страницы
+                current_offset = limit
+                # Если total был установлен искусственно (из-за total=0), используем другой подход
+                if total == items_count + 1:
+                    # Запрашиваем пока есть данные
+                    while True:
+                        api_response = await fetch_offers_api(page, api_params, current_offset, max_retries=3)
+
+                        if api_response and 'items' in api_response:
+                            response_items = api_response.get('items', [])
+                            if not response_items:
+                                break
+
+                            data = process_api_response(api_response)
+                            offers = data.get('offers', {})
+
+                            # Объединяем группы офферов
+                            for group, cards in offers.items():
+                                if group not in aggregated_offers:
+                                    aggregated_offers[group] = []
+                                aggregated_offers[group].extend(cards)
+
+                            offset = current_offset + limit
+                            save_progress(url_index, offset, str(PROGRESS_FILE))
+
+                            # Если получили меньше limit элементов, значит это последняя страница
+                            if len(response_items) < limit:
+                                break
+                        else:
+                            break
+
+                        await asyncio.sleep(3)
+                        current_offset += limit
+                else:
+                    # Обычный случай: total известен
+                    while current_offset < total:
+                        api_response = await fetch_offers_api(page, api_params, current_offset, max_retries=3)
+
+                        if api_response and 'items' in api_response:
+                            data = process_api_response(api_response)
+                            offers = data.get('offers', {})
+
+                            # Объединяем группы офферов
+                            for group, cards in offers.items():
+                                if group not in aggregated_offers:
+                                    aggregated_offers[group] = []
+                                aggregated_offers[group].extend(cards)
+
+                            offset = current_offset + limit
+                            save_progress(url_index, offset, str(PROGRESS_FILE))
+
+                        if current_offset + limit < total:
+                            await asyncio.sleep(3)
+
+                        current_offset += limit
+
+                # Для получения фотографий ЖК и ссылки на ход строительства нужно открыть страницу комплекса
+                complex_gallery_images: List[str] = []
+                aggregated_hod_url: str = None
+                construction_progress_data: Dict[str, Any] = None
+
+                if aggregated_complex_href:
+                    try:
+                        await page.goto(aggregated_complex_href, timeout=120000)
+                        await asyncio.sleep(3)
+
+                        # Извлекаем фотографии ЖК из галереи
+                        try:
+                            complex_photos_data = await page.evaluate("""
+                            () => {
+                              const complexPhotos = [];
+
+                              // Пробуем разные селекторы для галереи
+                              let galleryContainer = document.querySelector('[data-e2e-id="complex-header-gallery"]');
+                              if (!galleryContainer) {
+                                galleryContainer = document.querySelector('[data-e2e-id*="gallery"]');
+                              }
+                              if (!galleryContainer) {
+                                galleryContainer = document.querySelector('.gallery, [class*="gallery"], [class*="Gallery"]');
+                              }
+
+                              if (galleryContainer) {
+                                // Пробуем разные селекторы для изображений
+                                let imageElements = galleryContainer.querySelectorAll('[data-e2e-id^="complex-header-gallery-image__"]');
+                                if (imageElements.length === 0) {
+                                  imageElements = galleryContainer.querySelectorAll('img');
+                                }
+
+                                imageElements.forEach((element, idx) => {
+                                  // Пробуем разные способы получения изображения
+                                  let img = element;
+                                  if (element.tagName !== 'IMG') {
+                                    img = element.querySelector('img');
+                                  }
+
+                                  if (!img) {
+                                    // Пробуем найти img внутри элемента
+                                    img = element.querySelector('img.picture-image-object-fit--cover-820-5-0-5.picture-imageFillingContainer-4a2-5-0-5');
+                                  }
+                                  if (!img) {
+                                    // Пробуем любой img
+                                    img = element.querySelector('img');
+                                  }
+
+                                  if (img) {
+                                    // Пробуем разные атрибуты для получения URL
+                                    let imgUrl = img.src || img.getAttribute('src') || img.getAttribute('data-src') ||
+                                               img.getAttribute('data-lazy') || img.getAttribute('data-original');
+
+                                    if (imgUrl) {
+                                      try {
+                                        const absoluteUrl = new URL(imgUrl, location.origin).href;
+                                        // Фильтруем только реальные изображения
+                                        if (/\.(jpg|jpeg|png|webp)/i.test(absoluteUrl) || absoluteUrl.includes('img.dmclk.ru') || absoluteUrl.includes('vitrina')) {
+                                          complexPhotos.push(absoluteUrl);
+                                        }
+                                      } catch (e) {
+                                        if (imgUrl.startsWith('http')) {
+                                          complexPhotos.push(imgUrl);
+                                        }
+                                      }
+                                    }
+                                  }
+                                });
+                              }
+
+                              return complexPhotos;
                             }
-                            
-                            console.log('Image elements found:', imageElements.length);
-                            
-                            imageElements.forEach((element, idx) => {
-                              // Пробуем разные способы получения изображения
-                              let img = element;
-                              if (element.tagName !== 'IMG') {
-                                img = element.querySelector('img');
+                            """)
+                            complex_gallery_images = complex_photos_data or []
+                        except Exception:
+                            pass
+
+                        # Сохраняем ссылку на страницу "О ЖК" для хода строительства
+                        try:
+                            about_href = await page.evaluate("""
+                            () => {
+                              let a = document.querySelector('[data-e2e-id="complex-header-about"]');
+
+                              if (!a) {
+                                const links = Array.from(document.querySelectorAll('a'));
+                                a = links.find(link => {
+                                  const text = (link.textContent || '').toLowerCase().trim();
+                                  return text.includes('о жк') || text.includes('о комплексе') || text.includes('подробнее');
+                                });
                               }
-                              
-                              if (!img) {
-                                // Пробуем найти img внутри элемента
-                                img = element.querySelector('img.picture-image-object-fit--cover-820-5-0-5.picture-imageFillingContainer-4a2-5-0-5');
+                              if (!a) {
+                                const links = Array.from(document.querySelectorAll('a[href*="about"], a[href*="o-zhk"]'));
+                                if (links.length > 0) {
+                                  a = links[0];
+                                }
                               }
-                              if (!img) {
-                                // Пробуем любой img
-                                img = element.querySelector('img');
+                              if (!a) {
+                                const currentPath = location.pathname;
+                                const basePath = currentPath.split('/').slice(0, -1).join('/');
+                                const links = Array.from(document.querySelectorAll(`a[href*="${basePath}/about"], a[href*="${basePath}/o-zhk"]`));
+                                if (links.length > 0) {
+                                  a = links[0];
+                                }
                               }
-                              
-                              if (img) {
-                                // Пробуем разные атрибуты для получения URL
-                                let imgUrl = img.src || img.getAttribute('src') || img.getAttribute('data-src') || 
-                                           img.getAttribute('data-lazy') || img.getAttribute('data-original');
-                                
-                                if (imgUrl) {
+                              if (a) {
+                                const href = a.getAttribute('href') || a.href || null;
+                                if (href) {
                                   try {
-                                    const absoluteUrl = new URL(imgUrl, location.origin).href;
-                                    // Фильтруем только реальные изображения
-                                    if (/\.(jpg|jpeg|png|webp)/i.test(absoluteUrl) || absoluteUrl.includes('img.dmclk.ru') || absoluteUrl.includes('vitrina')) {
-                                      complexPhotos.push(absoluteUrl);
-                                    }
-                                  } catch (e) {
-                                    if (imgUrl.startsWith('http')) {
-                                      complexPhotos.push(imgUrl);
-                                    }
+                                    return new URL(href, location.origin).href;
+                                  } catch {
+                                    return href.startsWith('http') ? href : location.origin + (href.startsWith('/') ? href : '/' + href);
                                   }
                                 }
                               }
-                            });
-                          }
-                          
-                          console.log('Total photos found:', complexPhotos.length);
-                          return complexPhotos;
-                        }
-                        """)
-                        complex_gallery_images = complex_photos_data or []
-                        print(f"  Найдено фотографий ЖК: {len(complex_gallery_images)}")
-                        if complex_gallery_images:
-                            print(f"  Примеры URL фото ЖК: {complex_gallery_images[:3]}")
-                    except Exception as e:
-                        print(f"  Ошибка при извлечении фотографий ЖК: {e}")
-                        import traceback
-                        traceback.print_exc()
-                    
-                    # Сохраняем ссылку на страницу "О ЖК" для хода строительства
-                    try:
-                        about_href = await page.evaluate("""
-                        () => {
-                          // Пробуем разные селекторы для поиска ссылки "О ЖК"
-                          let a = document.querySelector('[data-e2e-id="complex-header-about"]');
-                          console.log('Found by data-e2e-id:', !!a);
-                          
-                          if (!a) {
-                            // Пробуем найти по тексту
-                            const links = Array.from(document.querySelectorAll('a'));
-                            a = links.find(link => {
-                              const text = (link.textContent || '').toLowerCase().trim();
-                              return text.includes('о жк') || text.includes('о комплексе') || text.includes('подробнее');
-                            });
-                            console.log('Found by text:', !!a);
-                          }
-                          if (!a) {
-                            // Пробуем найти ссылку, содержащую "about" или "o-zhk"
-                            const links = Array.from(document.querySelectorAll('a[href*="about"], a[href*="o-zhk"]'));
-                            if (links.length > 0) {
-                              a = links[0];
+                              return null;
                             }
-                            console.log('Found by href pattern:', !!a);
-                          }
-                          if (!a) {
-                            // Пробуем найти ссылку на страницу комплекса с путем /about или /o-zhk
-                            const currentPath = location.pathname;
-                            const basePath = currentPath.split('/').slice(0, -1).join('/'); // Убираем последний сегмент
-                            const links = Array.from(document.querySelectorAll(`a[href*="${basePath}/about"], a[href*="${basePath}/o-zhk"]`));
-                            if (links.length > 0) {
-                              a = links[0];
-                            }
-                            console.log('Found by base path:', !!a);
-                          }
-                          if (a) {
-                            const href = a.getAttribute('href') || a.href || null;
-                            console.log('Found href:', href);
-                            if (href) {
-                              // Преобразуем относительный URL в абсолютный
-                              try {
-                                return new URL(href, location.origin).href;
-                              } catch {
-                                return href.startsWith('http') ? href : location.origin + (href.startsWith('/') ? href : '/' + href);
-                              }
-                            }
-                          }
-                          console.log('No link found, returning null');
-                          return null;
-                        }
-                        """)
-                        print(f"  🔍 Результат поиска ссылки 'О ЖК': {about_href}")
-                        if about_href:
-                            print(f"  О ЖК URL: {about_href}")
-                            # Проверяем, не содержит ли уже URL путь к ходу строительства
-                            if '/hod-stroitelstva' in about_href:
-                                aggregated_hod_url = about_href
-                                print(f"  Ход строительства URL (уже содержит путь): {aggregated_hod_url}")
-                            elif about_href.endswith('/'):
-                                aggregated_hod_url = about_href + 'hod-stroitelstva'
-                                print(f"  Ход строительства URL: {aggregated_hod_url}")
+                            """)
+                            if about_href:
+                                if '/hod-stroitelstva' in about_href:
+                                    aggregated_hod_url = about_href
+                                elif about_href.endswith('/'):
+                                    aggregated_hod_url = about_href + 'hod-stroitelstva'
+                                else:
+                                    aggregated_hod_url = about_href + '/hod-stroitelstva'
                             else:
-                                aggregated_hod_url = about_href + '/hod-stroitelstva'
-                                print(f"  Ход строительства URL: {aggregated_hod_url}")
-                        else:
-                            print(f"  ⚠️ Ссылка 'О ЖК' не найдена на странице. Пробую альтернативный способ...")
-                            # Альтернативный способ: формируем URL напрямую из URL комплекса
+                                if aggregated_complex_href:
+                                    if '/hod-stroitelstva' in aggregated_complex_href:
+                                        aggregated_hod_url = aggregated_complex_href
+                                    elif aggregated_complex_href.endswith('/'):
+                                        aggregated_hod_url = aggregated_complex_href + 'hod-stroitelstva'
+                                    else:
+                                        aggregated_hod_url = aggregated_complex_href + '/hod-stroitelstva'
+                        except Exception:
                             if aggregated_complex_href:
-                                # Проверяем, не содержит ли уже URL путь к ходу строительства
                                 if '/hod-stroitelstva' in aggregated_complex_href:
                                     aggregated_hod_url = aggregated_complex_href
-                                    print(f"  Ход строительства URL (уже содержит путь): {aggregated_hod_url}")
                                 elif aggregated_complex_href.endswith('/'):
                                     aggregated_hod_url = aggregated_complex_href + 'hod-stroitelstva'
-                                    print(f"  Ход строительства URL (сформирован автоматически): {aggregated_hod_url}")
                                 else:
                                     aggregated_hod_url = aggregated_complex_href + '/hod-stroitelstva'
-                                    print(f"  Ход строительства URL (сформирован автоматически): {aggregated_hod_url}")
-                    except Exception as e:
-                        print(f"  ❌ Ошибка при извлечении ссылки на ход строительства: {e}")
-                        # Пробуем альтернативный способ даже при ошибке
-                        if aggregated_complex_href:
-                            # Проверяем, не содержит ли уже URL путь к ходу строительства
-                            if '/hod-stroitelstva' in aggregated_complex_href:
-                                aggregated_hod_url = aggregated_complex_href
-                                print(f"  Ход строительства URL (уже содержит путь): {aggregated_hod_url}")
-                            elif aggregated_complex_href.endswith('/'):
-                                aggregated_hod_url = aggregated_complex_href + 'hod-stroitelstva'
-                                print(f"  Ход строительства URL (сформирован автоматически после ошибки): {aggregated_hod_url}")
-                            else:
-                                aggregated_hod_url = aggregated_complex_href + '/hod-stroitelstva'
-                                print(f"  Ход строительства URL (сформирован автоматически после ошибки): {aggregated_hod_url}")
-                except Exception as e:
-                    print(f"  Ошибка при открытии страницы комплекса: {e}")
+                    except Exception:
+                        pass
 
-            # формируем запись под Mongo-схему
-            def to_db_item(complex_photos_urls: List[str] = None, processed_apartment_types: Dict[str, Any] = None) -> \
-                    Dict[str, Any]:
-                # Используем обработанные данные квартир, если они есть
-                apartment_types_data = processed_apartment_types or aggregated_offers
+                # Получаем ID комплекса для формирования ключей S3
+                complex_id = get_complex_id_from_url(aggregated_complex_href or base_url)
+
+                # Обрабатываем фотографии ЖК и загружаем в S3
+                complex_photos_urls = []
+                if complex_gallery_images:
+                    try:
+                        complex_photos_urls = await process_complex_photos(complex_gallery_images, complex_id)
+                    except Exception as e:
+                        logger.error(f"Ошибка при обработке фотографий ЖК: {e}")
+                        complex_photos_urls = []
+
+                # Обрабатываем фотографии всех квартир и загружаем в S3
+                processed_apartment_types = aggregated_offers or {}
+                if aggregated_offers:
+                    try:
+                        processed_apartment_types = await process_all_apartment_types(aggregated_offers, complex_id)
+                    except Exception as e:
+                        logger.error(f"Ошибка при обработке фотографий квартир: {e}")
+                        import traceback
+                        logger.error(f"Полный traceback:\n{traceback.format_exc()}")
+                        processed_apartment_types = aggregated_offers
+
+                # После сбора всех офферов: если есть hod_url — переходим и собираем ход строительства.
+                # При ошибках (прокси/соединение) — перезапускаем браузер и пробуем ещё раз.
+                if aggregated_hod_url:
+                    complex_id = get_complex_id_from_url(aggregated_complex_href or base_url)
+                    max_attempts_hod = 3
+                    attempt_hod = 0
+                    while attempt_hod < max_attempts_hod and not construction_progress_data:
+                        attempt_hod += 1
+                        try:
+                            stages_data = await extract_construction_from_domclick(page, aggregated_hod_url)
+                            if stages_data and stages_data.get('construction_stages'):
+                                construction_progress_data = await process_construction_stages_domclick(stages_data['construction_stages'], complex_id)
+                                break
+                            else:
+                                if attempt_hod < max_attempts_hod:
+                                    try:
+                                        browser, page, _ = await restart_browser(browser, headless=False)
+                                    except Exception:
+                                        try:
+                                            if browser:
+                                                await browser.close()
+                                        except Exception:
+                                            pass
+                                        browser = None
+                                        page = None
+                        except Exception:
+                            if attempt_hod < max_attempts_hod:
+                                try:
+                                    browser, page, _ = await restart_browser(browser, headless=False)
+                                except Exception:
+                                    try:
+                                        if browser:
+                                            await browser.close()
+                                    except Exception:
+                                        pass
+                                    browser = None
+                                    page = None
+
+                # формируем запись под Mongo-схему после обработки фото
+                apartment_types_data = processed_apartment_types or aggregated_offers or {}
 
                 apartment_types: Dict[str, Any] = {}
-                for group, cards in (apartment_types_data or {}).items():
-                    # cards может быть как списком, так и словарем с ключом "apartments"
+                for group, cards in apartment_types_data.items():
                     if isinstance(cards, list):
-                        # Если cards - это список квартир напрямую (уже обработанных)
                         apartment_types[group] = {
                             "apartments": [
                                 {
                                     "title": c.get("offer"),
-                                    "photos": c.get("photos") or [],  # URL к файлам в S3
+                                    "photos": c.get("photos") or [],
+                                    "area": c.get("area", ""),
+                                    "totalArea": c.get("totalArea"),
+                                    "price": c.get("price", ""),
+                                    "pricePerSquare": c.get("pricePerSquare", ""),
+                                    "completionDate": c.get("completionDate", ""),
+                                    "url": c.get("url", "")
                                 }
                                 for c in cards
                             ]
                         }
                     elif isinstance(cards, dict) and "apartments" in cards:
-                        # Если cards - это словарь с ключом "apartments"
                         apartment_list = cards["apartments"]
                         apartment_types[group] = {
                             "apartments": [
                                 {
                                     "title": c.get("offer"),
-                                    "photos": c.get("photos") or [],  # URL к файлам в S3
+                                    "photos": c.get("photos") or [],
+                                    "area": c.get("area", ""),
+                                    "totalArea": c.get("totalArea"),
+                                    "price": c.get("price", ""),
+                                    "pricePerSquare": c.get("pricePerSquare", ""),
+                                    "completionDate": c.get("completionDate", ""),
+                                    "url": c.get("url", "")
                                 }
                                 for c in apartment_list
                             ]
                         }
                     else:
-                        # Если неизвестная структура, пропускаем
                         apartment_types[group] = cards
-                        continue
-                # Нормализуем URL для единообразия
+
                 complex_url = normalize_complex_url(aggregated_complex_href) if aggregated_complex_href else None
                 if not complex_url:
-                    # Если не удалось нормализовать, используем base_url
                     complex_url = base_url
-                
-                return {
+
+                db_item = {
+                    "latitude": aggregated_latitude,
+                    "longitude": aggregated_longitude,
                     "url": complex_url,
                     "development": {
                         "complex_name": aggregated_complex_name,
                         "address": aggregated_address,
                         "source_url": base_url,
-                        "photos": complex_photos_urls or [],  # URL к фотографиям ЖК в S3
+                        "photos": complex_photos_urls or [],
                     },
                     "apartment_types": apartment_types,
                 }
 
-            # Получаем ID комплекса для формирования ключей S3
-            complex_id = get_complex_id_from_url(aggregated_complex_href or base_url)
+                if construction_progress_data:
+                    db_item.setdefault('development', {})['construction_progress'] = construction_progress_data
 
-            # Обрабатываем фотографии ЖК и загружаем в S3
-            complex_photos_urls = []
-            if complex_gallery_images:
                 try:
-                    complex_photos_urls = await process_complex_photos(complex_gallery_images, complex_id)
+                    save_to_mongodb([db_item])
                 except Exception as e:
-                    logger.error(f"Ошибка при обработке фотографий ЖК: {e}")
-                    complex_photos_urls = []
+                    print(f"Ошибка записи в MongoDB: {e}. Сохраню в {str(OUTPUT_FILE)} для отладки.")
+                    results.append({
+                        "sourceUrl": base_url,
+                        "data": {
+                            "address": aggregated_address,
+                            "complexName": aggregated_complex_name,
+                            "complexHref": aggregated_complex_href,
+                            "offers": processed_apartment_types,
+                            "complexPhotosUrls": complex_photos_urls
+                        }
+                    })
+                    with open(str(OUTPUT_FILE), 'w', encoding='utf-8') as f:
+                        json.dump(results, f, ensure_ascii=False, indent=2)
 
-            # Обрабатываем фотографии всех квартир и загружаем в S3
-            processed_apartment_types = aggregated_offers
-            if aggregated_offers:
+                url_index += 1
+                offset = 0
+                save_progress(url_index, offset, str(PROGRESS_FILE))
+
+            except Exception as url_error:
+                print(f"  ✗ Критическая ошибка при обработке URL: {url_error}")
+                # Закрываем браузер при критической ошибке
                 try:
-                    processed_apartment_types = await process_all_apartment_types(aggregated_offers, complex_id)
-                except Exception as e:
-                    logger.error(f"Ошибка при обработке фотографий квартир: {e}")
-                    processed_apartment_types = aggregated_offers
+                    if browser:
+                        await browser.close()
+                except Exception:
+                    pass
+                # Пытаемся создать новый браузер для следующего URL
+                try:
+                    browser, proxy_url = await create_browser(headless=False)
+                    page = await create_browser_page(browser)
+                except Exception:
+                    print("  ✗ Не удалось создать новый браузер, завершаю работу")
+                    break
+                url_index += 1
+                offset = 0
+                save_progress(url_index, offset, str(PROGRESS_FILE))
 
-            # После сбора всех офферов: если есть hod_url — переходим и собираем ход строительства.
-            # При ошибках (прокси/соединение) — перезапускаем браузер и пробуем ещё раз.
-            if aggregated_hod_url:
-                print(f"  Начинаю сбор хода строительства для URL: {aggregated_hod_url}")
-            else:
-                print(f"  ⚠️ URL хода строительства не найден, пропускаю сбор")
-            
-            if aggregated_hod_url:
-                complex_id = get_complex_id_from_url(aggregated_complex_href or base_url)
-                max_attempts_hod = 3
-                attempt_hod = 0
-                while attempt_hod < max_attempts_hod and not construction_progress_data:
-                    attempt_hod += 1
-                    try:
-                        print(f"  Переход на страницу хода строительства: {aggregated_hod_url} (попытка {attempt_hod}/{max_attempts_hod})")
-                        stages_data = await extract_construction_from_domclick(page, aggregated_hod_url)
-                        if stages_data and stages_data.get('construction_stages'):
-                            print(f"  Найдено этапов: {len(stages_data['construction_stages'])}")
-                            construction_progress_data = await process_construction_stages_domclick(stages_data['construction_stages'], complex_id)
-                            break
-                        else:
-                            print("  ⚠️ Этапы не получены со страницы хода строительства")
-                            # Пробуем перезапустить браузер на следующую попытку
-                            if attempt_hod < max_attempts_hod:
-                                try:
-                                    browser, page, _ = await restart_browser(browser, headless=False)
-                                except Exception:
-                                    pass
-                    except Exception as e:
-                        print(f"  ❌ Ошибка при сборе хода строительства: {e}")
-                        if attempt_hod < max_attempts_hod:
-                            try:
-                                browser, page, _ = await restart_browser(browser, headless=False)
-                                print("  🔄 Браузер перезапущен для повторной попытки хода строительства")
-                            except Exception as restart_error:
-                                print(f"  ⚠️ Ошибка перезапуска браузера: {restart_error}")
-
-            db_item = to_db_item(complex_photos_urls, processed_apartment_types)
-            if construction_progress_data:
-                db_item.setdefault('development', {})['construction_progress'] = construction_progress_data
-
-            try:
-                save_to_mongodb([db_item])
-
-
-            except Exception as e:
-                print(f"Ошибка записи в MongoDB: {e}. Сохраню в {str(OUTPUT_FILE)} для отладки.")
-                results.append({"sourceUrl": base_url,
-                                "data": {"address": aggregated_address, "complexName": aggregated_complex_name,
-                                         "complexHref": aggregated_complex_href, "offers": processed_apartment_types,
-                                         "complexPhotosUrls": complex_photos_urls}})
-                with open(str(OUTPUT_FILE), 'w', encoding='utf-8') as f:
-                    json.dump(results, f, ensure_ascii=False, indent=2)
-
-            url_index += 1
-            offset = 0
-            save_progress(url_index, offset, str(PROGRESS_FILE))
     finally:
         try:
             await browser.close()
-        except Exception as e:
-            print(f"Ошибка при закрытии браузера: {e}")
-            # Игнорируем ошибки закрытия браузера
-
+        except Exception:
+            pass  # Игнорируем ошибки закрытия браузера
 
 if __name__ == "__main__":
     asyncio.run(run())

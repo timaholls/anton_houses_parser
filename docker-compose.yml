@@ -37,6 +37,7 @@ services:
     container_name: parser_domclick
     environment:
       - EXECUTABLE_PATH=/usr/bin/google-chrome-stable
+      - PYTHONUNBUFFERED=1
     shm_size: '2gb'
     devices:
       - /dev/snd

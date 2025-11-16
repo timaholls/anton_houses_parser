@@ -6,11 +6,75 @@
 
 import os
 import sys
-
 import re
+import argparse
 from datetime import datetime, timezone
+from typing import Dict
+import time
+import requests
 from bson import ObjectId
 from pymongo import MongoClient
+
+GEOCODE_CACHE = {}
+GEOCODE_API_KEY = os.getenv("GEOCODE_MAPS_API_KEY", "6918e469cfcf9979670183uvrbb9a1f")
+
+
+def format_full_address(city: str, district: str, street: str, house: str) -> str:
+    parts = []
+    if city:
+        parts.append(f"г. {city}")
+    if district:
+        parts.append(f"р-он {district}")
+    if street:
+        parts.append(f"ул. {street}")
+    if house:
+        parts.append(f"д. {house}")
+    return ", ".join(parts)
+
+
+def fetch_address_from_coords(lat: float, lon: float) -> Dict[str, str]:
+    """Возвращает детали адреса по координатам через geocode.maps.co."""
+    if lat is None or lon is None:
+        return {}
+
+    cache_key = (round(lat, 6), round(lon, 6))
+    if cache_key in GEOCODE_CACHE:
+        return GEOCODE_CACHE[cache_key]
+
+    url = "https://geocode.maps.co/reverse"
+    params = {
+        "lat": lat,
+        "lon": lon,
+        "api_key": GEOCODE_API_KEY,
+    }
+    headers = {
+        "User-Agent": "anton_houses_parser/1.0 (anton@example.com)",
+    }
+
+
+    try:
+        resp = requests.get(url, params=params, headers=headers, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        addr = data.get("address", {}) or {}
+        city = addr.get("city") or addr.get("town") or addr.get("village")
+        district = addr.get("city_district") or addr.get("district") or addr.get("suburb")
+        street = addr.get("road") or addr.get("residential") or addr.get("pedestrian")
+        house_number = addr.get("house_number")
+        formatted_full = format_full_address(city, district, street, house_number)
+        details = {
+            "full": formatted_full or data.get("display_name"),
+            "city": city,
+            "district": district,
+            "street": street,
+            "house_number": house_number,
+        }
+        time.sleep(1)
+        GEOCODE_CACHE[cache_key] = details
+        return details
+    except Exception as e:
+        print(f"⚠️ Не удалось получить адрес по координатам ({lat}, {lon}): {e}")
+        return {}
 
 
 # Настройка Django
@@ -87,7 +151,6 @@ def get_source_timestamp(record):
                         max_timestamp = normalized_dt
                 else:
                     # Добавляем updated_at если его нет
-                    print(f"🔄 Добавляем updated_at для DomRF {domrf_id}")
                     current_time = datetime.now(timezone.utc)
                     db['domrf'].update_one(
                         {'_id': domrf_id},
@@ -97,7 +160,7 @@ def get_source_timestamp(record):
                     if not max_timestamp or current_time > max_timestamp:
                         max_timestamp = current_time
         except Exception as e:
-            print(f"Ошибка получения DomRF {domrf_id}: {e}")
+            print(f"❌ Ошибка получения DomRF {domrf_id}: {e}")
 
     # Проверяем Avito
     if record.get('_source_ids', {}).get('avito'):
@@ -112,7 +175,6 @@ def get_source_timestamp(record):
                         max_timestamp = normalized_dt
                 else:
                     # Добавляем updated_at если его нет
-                    print(f"🔄 Добавляем updated_at для Avito {avito_id}")
                     current_time = datetime.now(timezone.utc)
                     db['avito'].update_one(
                         {'_id': avito_id},
@@ -122,7 +184,7 @@ def get_source_timestamp(record):
                     if not max_timestamp or current_time > max_timestamp:
                         max_timestamp = current_time
         except Exception as e:
-            print(f"Ошибка получения Avito {avito_id}: {e}")
+            print(f"❌ Ошибка получения Avito {avito_id}: {e}")
 
     # Проверяем DomClick
     if record.get('_source_ids', {}).get('domclick'):
@@ -137,7 +199,6 @@ def get_source_timestamp(record):
                         max_timestamp = normalized_dt
                 else:
                     # Добавляем updated_at если его нет
-                    print(f"🔄 Добавляем updated_at для DomClick {domclick_id}")
                     current_time = datetime.now(timezone.utc)
                     db['domclick'].update_one(
                         {'_id': domclick_id},
@@ -147,10 +208,7 @@ def get_source_timestamp(record):
                     if not max_timestamp or current_time > max_timestamp:
                         max_timestamp = current_time
         except Exception as e:
-            print(f"Ошибка получения DomClick {domclick_id}: {e}")
-
-    if updated_records:
-        print(f"✅ Обновлены записи: {', '.join(updated_records)}")
+            print(f"❌ Ошибка получения DomClick {domclick_id}: {e}")
 
     return max_timestamp
 
@@ -161,61 +219,50 @@ def rebuild_unified_record(unified_record):
 
     # Получаем исходные записи
     source_ids = unified_record.get('_source_ids', {})
-    print(f"🔍 Source IDs: {source_ids}")
 
     domrf_record = None
     if source_ids.get('domrf'):
         try:
             domrf_record = db['domrf'].find_one({'_id': ObjectId(source_ids['domrf'])})
-            print(f"📄 DomRF record found: {bool(domrf_record)}")
         except Exception as e:
-            print(f"❌ Error getting DomRF: {e}")
+            print(f"❌ Ошибка получения DomRF: {e}")
 
     avito_record = None
     if source_ids.get('avito'):
         try:
             avito_record = db['avito'].find_one({'_id': ObjectId(source_ids['avito'])})
-            print(f"📄 Avito record found: {bool(avito_record)}")
         except Exception as e:
-            print(f"❌ Error getting Avito: {e}")
+            print(f"❌ Ошибка получения Avito: {e}")
 
     domclick_record = None
     if source_ids.get('domclick'):
         try:
             domclick_record = db['domclick'].find_one({'_id': ObjectId(source_ids['domclick'])})
-            print(f"📄 DomClick record found: {bool(domclick_record)}")
         except Exception as e:
-            print(f"❌ Error getting DomClick: {e}")
+            print(f"❌ Ошибка получения DomClick: {e}")
 
     # Проверяем, что у нас есть хотя бы одна запись
     if not avito_record and not domclick_record:
         print(f"❌ Нет исходных записей для unified_record {unified_record['_id']}")
         return None
 
-    # Определяем координаты (приоритет: DomRF > Avito > DomClick > существующие в unified_record)
-    latitude = None
-    longitude = None
+    # Для координат используем значения из unified_record, но при их отсутствии
+    # пробуем взять координаты из DomClick
+    latitude = unified_record.get('latitude')
+    longitude = unified_record.get('longitude')
 
-    if domrf_record:
-        latitude = domrf_record.get('latitude')
-        longitude = domrf_record.get('longitude')
-    elif avito_record:
-        latitude = avito_record.get('latitude')
-        longitude = avito_record.get('longitude')
-    elif domclick_record:
-        latitude = domclick_record.get('latitude')
-        longitude = domclick_record.get('longitude')
+    if (latitude is None or longitude is None) and domclick_record:
+        dc_lat = domclick_record.get('latitude')
+        dc_lon = domclick_record.get('longitude')
+        if dc_lat is not None and dc_lon is not None:
+            latitude = dc_lat
+            longitude = dc_lon
 
-    # Если координаты не найдены в исходных записях, берем из существующей unified_record
-    if not latitude or not longitude:
-        latitude = unified_record.get('latitude')
-        longitude = unified_record.get('longitude')
-        if latitude and longitude:
-            print(f"📍 Используем существующие координаты из unified_record: ({latitude}, {longitude})")
-
-    if not latitude or not longitude:
-        print(f"⚠️ Нет координат ни в исходных записях, ни в unified_record {unified_record['_id']}")
+    if latitude is None or longitude is None:
+        print(f"⚠️ Нет координат для записи {unified_record['_id']}")
         return None
+
+    geocoded_address = fetch_address_from_coords(latitude, longitude)
 
     # === ПЕРЕСОЗДАЕМ ЗАПИСЬ С НУЛЯ ПО ТОЧНОЙ ЛОГИКЕ save_manual_match ===
 
@@ -242,6 +289,41 @@ def rebuild_unified_record(unified_record):
         'updated_at': datetime.now(timezone.utc)
     }
 
+    # Переносим рейтинг и связанные поля, если они есть
+    rating_fields = [
+        'rating',
+        'rating_description',
+        'rating_created_at',
+        'rating_updated_at'
+    ]
+    for field in rating_fields:
+        if field in unified_record:
+            new_record[field] = unified_record.get(field)
+
+    # Сохраняем разбитый адрес, если удалось получить
+    address_fields = [
+        ('address_full', 'full'),
+        ('address_city', 'city'),
+        ('address_district', 'district'),
+        ('address_street', 'street'),
+        ('address_house', 'house_number'),
+    ]
+
+    for field, geo_key in address_fields:
+        existing_value = unified_record.get(field)
+        new_value = geocoded_address.get(geo_key) if geocoded_address else None
+
+        if field == 'address_full':
+            if new_value:
+                new_record[field] = new_value
+            elif existing_value is not None:
+                new_record[field] = existing_value
+        else:
+            if existing_value is not None:
+                new_record[field] = existing_value
+            elif new_value:
+                new_record[field] = new_value
+
     # Проверяем изменения координат
     if unified_record.get('latitude') != latitude or unified_record.get('longitude') != longitude:
         changes.append(
@@ -252,15 +334,15 @@ def rebuild_unified_record(unified_record):
         avito_dev = avito_record.get('development', {})
         if isinstance(avito_dev, dict):
             new_name = avito_dev.get('name', '')
-            new_address = avito_dev.get('address', '')
+            new_address = geocoded_address.get('full') if geocoded_address else None
+            if not new_address:
+                new_address = new_record.get('address_full') or old_dev.get('address', '')
             new_price = avito_dev.get('price_range', '')
             new_korpuses = avito_dev.get('korpuses', [])
 
             # Проверяем изменения
             if old_dev.get('name') != new_name:
                 changes.append(f"🏢 Название: '{old_dev.get('name', '')}' → '{new_name}'")
-            if old_dev.get('address') != new_address:
-                changes.append(f"📫 Адрес: '{old_dev.get('address', '')}' → '{new_address}'")
             if old_dev.get('price_range') != new_price:
                 changes.append(f"💰 Цены: '{old_dev.get('price_range', '')}' → '{new_price}'")
             if len(old_dev.get('korpuses', [])) != len(new_korpuses):
@@ -299,11 +381,6 @@ def rebuild_unified_record(unified_record):
         avito_apt_types = avito_record.get('apartment_types', {})
         domclick_apt_types = domclick_record.get('apartment_types', {})
 
-        print(f"\n🔍 === ОБЪЕДИНЕНИЕ APARTMENT_TYPES ===")
-        print(f"📊 Типы в Avito: {list(avito_apt_types.keys())}")
-        print(f"📊 Типы в DomClick: {list(domclick_apt_types.keys())}")
-        print(f"📊 Старые типы в unified: {list(old_apt_types.keys())}")
-
         # Маппинг старых названий на новые упрощенные (ТОЧНО КАК В save_manual_match)
         name_mapping = {
             # Студия
@@ -337,68 +414,34 @@ def rebuild_unified_record(unified_record):
             # Упрощаем название типа
             simplified_name = name_mapping.get(dc_type_name, dc_type_name)
 
-            print(f"\n  🔄 Обрабатываем тип DomClick: '{dc_type_name}' → упрощенное: '{simplified_name}'")
-
             # Пропускаем если уже обработали этот упрощенный тип
             if simplified_name in processed_types:
-                print(f"    ⏭️ Пропущено: тип '{simplified_name}' уже обработан ранее")
                 continue
             processed_types.add(simplified_name)
 
             # Получаем квартиры из DomClick
             dc_apartments = dc_type_data.get('apartments', [])
-            print(f"    📦 Квартир в DomClick: {len(dc_apartments)}")
 
             if not dc_apartments:
-                print(f"    ⚠️ Пропущено: нет квартир в DomClick для типа '{dc_type_name}'")
                 continue
 
             # Берем ВСЕ данные из DomClick без сопоставления с Avito
             combined_apartments = []
             skipped_no_photos = 0
 
-            print(f"    🔗 Берем все квартиры из DomClick:")
-
-            # Парсим все квартиры из DomClick для логирования
-            print(f"    📋 Парсинг квартир из DomClick:")
-            for idx, dc_apt in enumerate(dc_apartments):
-                dc_title = dc_apt.get('title', '')
-                dc_area, dc_floor = parse_apartment_info(dc_title)
-                # Проверяем оба поля для совместимости
-                has_photos = len(dc_apt.get('photos') or dc_apt.get('images') or []) > 0
-                print(f"      [{idx}] '{dc_title[:60] if dc_title else 'нет title'}...'")
-                print(
-                    f"          Площадь: {dc_area if dc_area else 'не распознана'}, Этаж: {dc_floor if dc_floor else 'не распознан'}, Фото: {'есть' if has_photos else 'нет'}")
-
             for i, dc_apt in enumerate(dc_apartments):
                 # Получаем ВСЕ фото этой квартиры из DomClick как МАССИВ
                 # Проверяем оба поля для совместимости
                 apartment_photos = dc_apt.get('photos') or dc_apt.get('images') or []
-                
-                # Логируем структуру квартиры для отладки
-                if i == 0:  # Логируем только первую квартиру для примера
-                    print(f"      📋 Структура квартиры DomClick (пример):")
-                    print(f"         Ключи: {list(dc_apt.keys())}")
-                    print(f"         title: {dc_apt.get('title', 'НЕТ')}")
-                    print(f"         photos: {len(apartment_photos)} элементов")
-                    if apartment_photos:
-                        print(f"         Первое фото: {apartment_photos[0][:80]}...")
 
                 # Если фото нет - пропускаем эту квартиру
                 if not apartment_photos:
                     skipped_no_photos += 1
-                    print(f"\n      ⚠️ Квартира DomClick #{i + 1}: пропущена (нет фото)")
                     continue
 
                 # Парсим информацию о квартире из DomClick
                 dc_title = dc_apt.get('title', '')
                 dc_area, dc_floor = parse_apartment_info(dc_title)
-
-                print(f"\n      ✅ Квартира DomClick #{i + 1}:")
-                print(f"         Title: '{dc_title[:60]}...'")
-                print(
-                    f"         📐 Парсинг: Площадь={dc_area if dc_area else 'не распознана'}, Этаж={dc_floor if dc_floor else 'не распознан'}")
-                print(f"         📸 Фото: {len(apartment_photos)} шт.")
 
                 # Берем ВСЕ данные из DomClick
                 combined_apartments.append({
@@ -412,23 +455,12 @@ def rebuild_unified_record(unified_record):
                     'image': apartment_photos  # МАССИВ всех фото этой планировки из DomClick!
                 })
 
-            if skipped_no_photos > 0:
-                print(f"\n    ⚠️ Пропущено квартир без фото: {skipped_no_photos}")
-
             # Добавляем в результат все квартиры из DomClick с фото
             if combined_apartments:
                 new_record['apartment_types'][simplified_name] = {
                     'apartments': combined_apartments
                 }
                 new_apt_counts[simplified_name] = len(combined_apartments)
-                print(f"    ✅ Тип '{simplified_name}' добавлен: {len(combined_apartments)} квартир")
-            else:
-                print(f"    ⚠️ Тип '{simplified_name}' не добавлен: нет квартир с фото")
-
-        print(f"\n📊 === ИТОГИ ОБЪЕДИНЕНИЯ ===")
-        print(f"📦 Старое количество квартир: {total_old_apartments}")
-        print(f"📦 Новое количество квартир: {sum(new_apt_counts.values())}")
-        print(f"📋 Новые типы: {list(new_apt_counts.keys())}")
 
         # Логируем изменения в количестве квартир
         total_new_apartments = sum(new_apt_counts.values())
@@ -451,58 +483,68 @@ def rebuild_unified_record(unified_record):
     # 4. Сохраняем ссылки на исходные записи
     new_record['_source_ids'] = source_ids
 
-    # Выводим все изменения
+    # Выводим изменения только если они есть
     if changes:
-        print(f"\n📝 ИЗМЕНЕНИЯ В ЗАПИСИ:")
-        for change in changes:
-            print(f"   {change}")
-        print()
-    else:
-        print(f"✅ Данные актуальны, изменений нет\n")
+        print(f"   Изменения: {', '.join(change.split(':')[0] for change in changes[:3])}{'...' if len(changes) > 3 else ''}")
 
     return new_record
 
 
 def main():
     """Основная функция обновления"""
+    # Парсим аргументы командной строки
+    parser = argparse.ArgumentParser(description='Обновление объединенных записей unified_houses')
+    parser.add_argument('--id', type=str, help='ID конкретной записи для обновления (ObjectId)')
+    args = parser.parse_args()
+
     print("🔄 Начинаем инкрементальное обновление unified_houses...")
 
     db = get_mongo_connection()
     unified_col = db['unified_houses']
 
-    # Получаем все объединенные записи
-    unified_records = list(unified_col.find({}))
+    # Если указан --id, обновляем только эту запись
+    if args.id:
+        try:
+            record_id = ObjectId(args.id)
+            record = unified_col.find_one({'_id': record_id})
+            if not record:
+                print(f"❌ Запись с ID {args.id} не найдена")
+                return
+            unified_records = [record]
+            print(f"🎯 Обновляем только запись с ID: {args.id}")
+        except Exception as e:
+            print(f"❌ Ошибка при обработке ID {args.id}: {e}")
+            print(f"   Убедитесь, что ID является валидным ObjectId")
+            return
+    else:
+        # Получаем все объединенные записи
+        unified_records = list(unified_col.find({}))
+        print(f"📊 Найдено {len(unified_records)} объединенных записей")
+    
     total_records = len(unified_records)
-
-    print(f"📊 Найдено {total_records} объединенных записей")
 
     updated_count = 0
     skipped_count = 0
     error_count = 0
+    error_records = []  # Список записей с ошибками
 
     for i, record in enumerate(unified_records, 1):
+        record_id = str(record.get('_id', 'unknown'))
+        record_name = record.get('development', {}).get('name', 'Без названия')
+        
         try:
-            print(f"\n[{i}/{total_records}] Обрабатываем: {record.get('development', {}).get('name', 'Без названия')}")
+            print(f"\n[{i}/{total_records}] {record_name}")
 
             # Получаем дату последнего обновления исходных записей
             source_timestamp = get_source_timestamp(record)
 
             if not source_timestamp:
-                print(f"⚠️ Нет информации о дате обновления исходных записей")
                 skipped_count += 1
                 continue
 
             # Получаем дату последнего обновления объединенной записи
             unified_timestamp = record.get('updated_at', record.get('_id').generation_time)
             unified_timestamp = normalize_datetime(unified_timestamp)
-
-            # Сравниваем даты
-            # if source_timestamp <= unified_timestamp:
-            #     print(f"✅ Запись актуальна (исходные: {source_timestamp}, объединенная: {unified_timestamp})")
-            #     skipped_count += 1
-            #     continue
-
-            print(f"🔄 Обновляем (исходные: {source_timestamp}, объединенная: {unified_timestamp})")
 
             # Пересоздаем запись
             new_record = rebuild_unified_record(record)
@@ -515,24 +557,50 @@ def main():
                 )
 
                 if result.modified_count > 0:
-                    print(f"✅ Запись обновлена")
                     updated_count += 1
                 else:
-                    print(f"⚠️ Запись не изменилась")
                     skipped_count += 1
             else:
-                print(f"❌ Не удалось пересоздать запись")
                 error_count += 1
+                error_records.append({
+                    'id': record_id,
+                    'name': record_name,
+                    'error': 'Не удалось пересоздать запись'
+                })
 
         except Exception as e:
-            print(f"❌ Ошибка обработки записи: {e}")
+            import traceback
             error_count += 1
+            error_records.append({
+                'id': record_id,
+                'name': record_name,
+                'error': str(e),
+                'traceback': traceback.format_exc()
+            })
+            print(f"❌ ОШИБКА: {record_name} (ID: {record_id})")
+            print(f"   {str(e)}")
 
-    print(f"\n📊 Результаты обновления:")
+    print(f"\n{'='*60}")
+    print(f"📊 Результаты обновления:")
     print(f"✅ Обновлено: {updated_count}")
     print(f"⏭️ Пропущено: {skipped_count}")
     print(f"❌ Ошибок: {error_count}")
     print(f"📈 Всего обработано: {updated_count + skipped_count + error_count}")
+    
+    if error_records:
+        print(f"\n{'='*60}")
+        print(f"❌ ОШИБОЧНЫЕ ЗАПИСИ ({len(error_records)}):")
+        print(f"{'='*60}")
+        for err_record in error_records:
+            print(f"\n🔴 ID: {err_record['id']}")
+            print(f"   Название: {err_record['name']}")
+            print(f"   Ошибка: {err_record['error']}")
+            if 'traceback' in err_record:
+                print(f"   Traceback:")
+                for line in err_record['traceback'].split('\n'):
+                    if line.strip():
+                        print(f"      {line}")
+        print(f"\n{'='*60}")
 
 
 if __name__ == "__main__":

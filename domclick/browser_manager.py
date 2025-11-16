@@ -3,8 +3,8 @@ import random
 
 
 # Настройки браузера
-# EXECUTABLE_PATH = "C:\Program Files\Google\Chrome\Application\chrome.exe"
-EXECUTABLE_PATH = "/usr/bin/google-chrome-stable"
+EXECUTABLE_PATH = "C:\Program Files\Google\Chrome\Application\chrome.exe"
+# EXECUTABLE_PATH = "/usr/bin/google-chrome-stable"
 PROXY_HOST = "192.168.0.148"
 PROXY_PORTS = [3128, 3129, 3130, 3131, 3132, 3133, 3134, 3135, 3136]
 
@@ -129,11 +129,24 @@ async def restart_browser(old_browser, headless: bool = False):
     Returns:
         tuple: (новый браузер, новая страница, proxy_url)
     """
+    # Закрываем старый браузер перед созданием нового
     if old_browser:
-        await old_browser.close()
+        try:
+            await old_browser.close()
+        except Exception:
+            pass  # Игнорируем ошибки закрытия, браузер может быть уже закрыт
     
-    new_browser, proxy_url = await create_browser(headless)
-    new_page = await create_browser_page(new_browser)
-    
-    return new_browser, new_page, proxy_url
+    # Создаем новый браузер
+    try:
+        new_browser, proxy_url = await create_browser(headless)
+        new_page = await create_browser_page(new_browser)
+        return new_browser, new_page, proxy_url
+    except Exception as e:
+        # Если не удалось создать новый браузер, убеждаемся что старый закрыт
+        if old_browser:
+            try:
+                await old_browser.close()
+            except Exception:
+                pass
+        raise  # Пробрасываем исключение дальше
 

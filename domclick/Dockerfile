@@ -2,6 +2,7 @@ FROM consol/debian-xfce-vnc:latest
 
 ENV TZ="Asia/Yekaterinburg"
 ENV LANG=en_US.UTF-8
+ENV PYTHONUNBUFFERED=1
 
 USER 0
 

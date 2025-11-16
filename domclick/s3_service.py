@@ -22,6 +22,16 @@ class S3Service:
         region_name = os.getenv("AWS_S3_REGION_NAME")
         self.bucket_name = os.getenv("AWS_STORAGE_BUCKET_NAME")
 
+        # Проверяем обязательные переменные окружения
+        if not endpoint_url:
+            raise ValueError("AWS_S3_ENDPOINT_URL не установлена в переменных окружения")
+        if not access_key_id:
+            raise ValueError("AWS_ACCESS_KEY_ID не установлена в переменных окружения")
+        if not secret_access_key:
+            raise ValueError("AWS_SECRET_ACCESS_KEY не установлена в переменных окружения")
+        if not self.bucket_name:
+            raise ValueError("AWS_STORAGE_BUCKET_NAME не установлена в переменных окружения")
+
         # Инициализация клиента S3
         self.s3_client = boto3.client(
             "s3",

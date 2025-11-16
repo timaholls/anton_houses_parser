@@ -4,6 +4,7 @@
 Содержит функции для подключения, сохранения и обновления данных
 """
 import os
+import re
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -34,30 +35,40 @@ def get_mongo_client():
         return None
 
 
+def extract_slug_from_url(url: Optional[str]) -> Optional[str]:
+    """Возвращает slug комплекса из URL."""
+    if not url:
+        return None
+    try:
+        parsed = urlparse(url)
+        parts = [part for part in parsed.path.split('/') if part]
+        if 'complexes' in parts:
+            idx = parts.index('complexes')
+            if idx + 1 < len(parts):
+                return parts[idx + 1]
+    except Exception:
+        pass
+    return None
+
+
 def normalize_complex_url(url: str) -> str:
     """
     Нормализует URL комплекса, приводя к единому формату.
     Всегда использует ufa.domclick.ru для единообразия.
     """
-    if not url:
-        return url
-    
-    try:
-        parsed = urlparse(url)
-        path_parts = parsed.path.split('/')
-        if 'complexes' in path_parts:
-            complex_index = path_parts.index('complexes')
-            if complex_index + 1 < len(path_parts):
-                slug = path_parts[complex_index + 1]
-                # Всегда используем ufa.domclick.ru
-                return f"https://ufa.domclick.ru/complexes/{slug}"
-    except Exception:
-        pass
-    
+    slug = extract_slug_from_url(url)
+    if slug:
+        return f"https://ufa.domclick.ru/complexes/{slug}"
     return url
 
 
-def find_existing_record(collection, url: str):
+def normalize_complex_name(name: Optional[str]) -> Optional[str]:
+    if not name:
+        return None
+    return re.sub(r'\s+', ' ', name).strip().lower()
+
+
+def find_existing_record(collection, url: str, complex_name: Optional[str] = None):
     """
     Ищет существующую запись по URL, учитывая разные варианты доменов.
     Ищет по нормализованному URL и по slug комплекса.
@@ -80,21 +91,33 @@ def find_existing_record(collection, url: str):
             return existing
     
     # Если не нашли, пытаемся найти по slug комплекса
-    try:
-        parsed = urlparse(normalized_url)
-        path_parts = parsed.path.split('/')
-        if 'complexes' in path_parts:
-            complex_index = path_parts.index('complexes')
-            if complex_index + 1 < len(path_parts):
-                slug = path_parts[complex_index + 1]
-                # Ищем записи, где URL содержит этот slug
-                existing = collection.find_one({
-                    'url': {'$regex': f'/complexes/{slug}'}
-                })
-                if existing:
-                    return existing
-    except Exception:
-        pass
+    slug = extract_slug_from_url(normalized_url)
+    if slug:
+        existing = collection.find_one({
+            'url': {'$regex': f'/complexes/{re.escape(slug)}$', '$options': 'i'}
+        })
+        if existing:
+            return existing
+    
+    # Ищем по slug в оригинальном URL (для совместимости)
+    if slug:
+        existing = collection.find_one({
+            'url': {'$regex': re.escape(slug), '$options': 'i'}
+        })
+        if existing:
+            return existing
+    
+    # Ищем по названию комплекса
+    normalized_name = normalize_complex_name(complex_name)
+    if normalized_name:
+        existing = collection.find_one({'normalized_complex_name': normalized_name})
+        if existing:
+            return existing
+        existing = collection.find_one({
+            'development.complex_name': {'$regex': f'^{re.escape(complex_name)}$', '$options': 'i'}
+        })
+        if existing:
+            return existing
     
     return None
 
@@ -107,6 +130,14 @@ def compare_and_merge_data(existing_data, new_data):
     merged = existing_data.copy()
     changes = []
     
+    # Обновляем координаты (корневые поля)
+    for coord_field in ("latitude", "longitude"):
+        new_value = new_data.get(coord_field)
+        if new_value not in (None, "", []):
+            if existing_data.get(coord_field) != new_value:
+                merged[coord_field] = new_value
+                changes.append(coord_field)
+
     # Обновляем development только если есть новые данные
     if 'development' in new_data and new_data['development']:
         for key, value in new_data['development'].items():
@@ -127,24 +158,74 @@ def compare_and_merge_data(existing_data, new_data):
                 old_apartments = merged['apartment_types'].get(apt_type, {}).get('apartments', [])
                 new_apartments = apt_data['apartments']
                 
-                # Сравниваем не только количество, но и содержимое (особенно пути к фото)
+                # Сравниваем не только количество, но и все поля каждой квартиры
                 apartments_changed = False
-                if len(old_apartments) != len(new_apartments):
-                    apartments_changed = True
-                else:
-                    # Проверяем изменения в фотографиях квартир
-                    for old_apt, new_apt in zip(old_apartments, new_apartments):
-                        old_photos = old_apt.get('photos', [])
-                        new_photos = new_apt.get('photos', [])
-                        if old_photos != new_photos:
+                
+                # Создаем словарь старых квартир по title для быстрого поиска
+                old_apts_by_title = {apt.get('title', ''): apt for apt in old_apartments}
+                
+                # Проверяем изменения во всех полях каждой квартиры
+                for new_apt in new_apartments:
+                    new_title = new_apt.get('title', '')
+                    old_apt = old_apts_by_title.get(new_title)
+                    
+                    # Если квартиры с таким title нет в старых данных - есть изменения
+                    if not old_apt:
+                        apartments_changed = True
+                        break
+                    
+                    # Список полей для сравнения
+                    fields_to_check = [
+                        'title', 'photos', 'area', 'totalArea', 
+                        'price', 'pricePerSquare', 'completionDate', 'url'
+                    ]
+                    
+                    for field in fields_to_check:
+                        old_value = old_apt.get(field)
+                        new_value = new_apt.get(field)
+                        
+                        # Если поле отсутствует в старых данных, но есть в новых (и не пустое) - это изменение
+                        if field not in old_apt and new_value not in (None, '', []):
                             apartments_changed = True
                             break
+                        
+                        # Нормализуем значения для сравнения (пустые строки и None считаем одинаковыми)
+                        old_normalized = old_value if old_value not in (None, '') else None
+                        new_normalized = new_value if new_value not in (None, '') else None
+                        
+                        # Для списков (photos) сравниваем содержимое
+                        if field == 'photos':
+                            old_list = old_value if isinstance(old_value, list) else []
+                            new_list = new_value if isinstance(new_value, list) else []
+                            if old_list != new_list:
+                                apartments_changed = True
+                                break
+                        # Для чисел сравниваем с учетом None
+                        elif field in ('totalArea',):
+                            if old_normalized != new_normalized:
+                                apartments_changed = True
+                                break
+                        # Для строк сравниваем значения
+                        else:
+                            if old_normalized != new_normalized:
+                                apartments_changed = True
+                                break
+                    
+                    if apartments_changed:
+                        break
+                
+                # Также проверяем, не удалились ли какие-то квартиры
+                if not apartments_changed and len(old_apartments) != len(new_apartments):
+                    apartments_changed = True
                 
                 if apt_type not in merged['apartment_types'] or apartments_changed:
                     merged['apartment_types'][apt_type] = apt_data
                     old_count = len(old_apartments)
                     new_count = len(new_apartments)
-                    changes.append(f"apartment_types.{apt_type} ({old_count} → {new_count} квартир)")
+                    if apartments_changed:
+                        changes.append(f"apartment_types.{apt_type} ({old_count} → {new_count} квартир, данные обновлены)")
+                    else:
+                        changes.append(f"apartment_types.{apt_type} ({old_count} → {new_count} квартир)")
     
     # Обновляем total_apartments
     if 'apartment_types' in merged:
@@ -180,7 +261,14 @@ def save_to_mongodb(data):
             item['url'] = normalized_url  # Сохраняем нормализованный URL
             
             # Ищем существующую запись по URL (с учетом разных вариантов доменов)
-            existing = find_existing_record(collection, normalized_url)
+            complex_name = item.get('development', {}).get('complex_name')
+            normalized_name = None
+            if complex_name:
+                normalized_name = normalize_complex_name(complex_name)
+                if normalized_name:
+                    item['normalized_complex_name'] = normalized_name
+            
+            existing = find_existing_record(collection, normalized_url, complex_name)
             
             if existing:
                 existing_url = existing.get('url', '')
@@ -195,6 +283,11 @@ def save_to_mongodb(data):
                 
                 # Убеждаемся, что URL нормализован
                 merged_data['url'] = normalized_url
+                
+                if normalized_name:
+                    merged_data['normalized_complex_name'] = normalized_name
+                elif 'normalized_complex_name' in existing:
+                    merged_data['normalized_complex_name'] = existing['normalized_complex_name']
                 
                 if changes:
                     print(f"🔄 Обнаружены изменения:")

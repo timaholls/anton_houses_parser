@@ -46,6 +46,8 @@ PROGRESS_FILE = PROJECT_ROOT / "progress_domclick_2.json"
 OUTPUT_FILE = PROJECT_ROOT / "offers_data.json"  # больше не используется как основной, оставим для отладки
 START_PAUSE_SECONDS = 5  # пауза после открытия URL
 STEP_PAUSE_SECONDS = 5  # пауза между страницами/шагами
+FETCH_OFFERS_MAX_RETRIES = 5
+FIRST_PAGE_FETCH_ATTEMPTS = 5
 
 # Настройка логгера для ImageProcessor
 logger = logging.getLogger(__name__)
@@ -121,6 +123,175 @@ def normalize_complex_url(url: str) -> str:
         pass
     
     return url
+
+
+def is_complex_url(url: str) -> bool:
+    """
+    Проверяет, похоже ли, что URL указывает напрямую на страницу ЖК.
+    """
+    if not url:
+        return False
+    try:
+        parsed = urlparse(url)
+        path_parts = parsed.path.split('/')
+        return 'complexes' in path_parts
+    except Exception:
+        return False
+
+
+def derive_complex_href_from_params(api_params: Dict[str, Any]) -> Optional[str]:
+    """
+    Пытается построить ссылку на страницу ЖК по параметрам URL (complexes, complex_id и т.д.).
+    """
+    if not api_params:
+        return None
+
+    candidate_keys = [
+        "complexes",
+        "complex",
+        "complex_id",
+        "complexes_id",
+        "complexes_ids",
+        "complex_slug",
+        "complexSlug",
+        "slug"
+    ]
+
+    for key in candidate_keys:
+        if key not in api_params:
+            continue
+        value = api_params[key]
+        if isinstance(value, list):
+            value = next((v for v in value if v), None)
+        if value is None:
+            continue
+        value_str = str(value).strip()
+        if not value_str:
+            continue
+
+        if value_str.startswith("http"):
+            return normalize_complex_url(value_str)
+
+        slug = value_str.split(",")[0].strip()
+        if not slug:
+            continue
+        return normalize_complex_url(f"https://ufa.domclick.ru/complexes/{slug}")
+
+    return None
+
+
+async def check_ban_and_restart(page, browser, max_restarts: int = 3) -> Tuple[bool, Any, Any]:
+    """
+    Проверяет HTML страницы на наличие строки бана "Похоже, ваш запрос выглядит".
+    Если бан обнаружен, перезапускает браузер с новым прокси.
+    Возвращает (was_banned, browser, page) - был ли бан и обновленные browser/page.
+    """
+    try:
+        html_content = await page.content()
+        if "Похоже, ваш запрос выглядит" in html_content:
+            logger.warning("  ⚠️ Обнаружен бан! Перезапускаю браузер с новым прокси...")
+            for restart_attempt in range(max_restarts):
+                try:
+                    browser, page, _ = await restart_browser(browser, headless=False)
+                    logger.info(f"  ✓ Браузер перезапущен с новым прокси (попытка {restart_attempt + 1})")
+                    return True, browser, page
+                except Exception as restart_error:
+                    logger.error(f"  ✗ Ошибка перезапуска браузера (попытка {restart_attempt + 1}): {restart_error}")
+                    if restart_attempt < max_restarts - 1:
+                        await asyncio.sleep(2)
+                    else:
+                        logger.error("  ✗ Не удалось перезапустить браузер после всех попыток")
+                        return True, browser, page
+    except Exception as e:
+        logger.warning(f"  ⚠️ Ошибка при проверке бана: {e}")
+    
+    return False, browser, page
+
+
+async def extract_gallery_images(page) -> List[str]:
+    """
+    Возвращает список URL изображений галереи с текущей открытой страницы.
+    """
+    try:
+        data = await page.evaluate(r"""
+        () => {
+          const complexPhotos = [];
+
+          // Пробуем разные селекторы для галереи
+          let galleryContainer = document.querySelector('[data-e2e-id="complex-header-gallery"]');
+          if (!galleryContainer) {
+            galleryContainer = document.querySelector('[data-e2e-id*="gallery"]');
+          }
+          if (!galleryContainer) {
+            galleryContainer = document.querySelector('.gallery, [class*="gallery"], [class*="Gallery"]');
+          }
+
+          if (!galleryContainer) {
+            return [];
+          }
+
+          // Пробуем разные селекторы для изображений
+          let imageElements = galleryContainer.querySelectorAll('[data-e2e-id^="complex-header-gallery-image__"]');
+          if (imageElements.length === 0) {
+            imageElements = galleryContainer.querySelectorAll('img');
+          }
+
+          const toAbs = (u) => {
+            try { return new URL(u, location.origin).href; } catch { return u || null; }
+          };
+          const pickFromSrcset = (srcset) => {
+            if (!srcset) return null;
+            const first = String(srcset).split(',')[0].trim().split(' ')[0];
+            return first || null;
+          };
+
+          imageElements.forEach((element) => {
+            let img = element;
+            if (element.tagName !== 'IMG') {
+              img = element.querySelector('img');
+            }
+            if (!img) {
+              img = element.querySelector('img.picture-image-object-fit--cover-820-5-0-5.picture-imageFillingContainer-4a2-5-0-5');
+            }
+            if (!img) {
+              img = element.querySelector('img');
+            }
+            if (!img) {
+              return;
+            }
+
+            const candidates = [
+              img.src,
+              img.getAttribute('src'),
+              img.getAttribute('data-src'),
+              img.getAttribute('data-lazy'),
+              img.getAttribute('data-original'),
+              pickFromSrcset(img.getAttribute('srcset'))
+            ];
+
+            candidates
+              .filter(Boolean)
+              .map(toAbs)
+              .filter(Boolean)
+              .forEach((absoluteUrl) => {
+                if (
+                  /\.(jpg|jpeg|png|webp)/i.test(absoluteUrl) ||
+                  absoluteUrl.includes('img.dmclk.ru') ||
+                  absoluteUrl.includes('vitrina')
+                ) {
+                  complexPhotos.push(absoluteUrl);
+                }
+              });
+          });
+
+          return complexPhotos;
+        }
+        """)
+        if isinstance(data, list):
+            return [str(url) for url in data if isinstance(url, str) and url]
+    except Exception as error:
+        logger.warning(f"  Не удалось прочитать галерею (evaluate): {error}")
+    return []
 
 
 async def extract_construction_from_domclick(page, hod_url: str) -> Dict[str, Any]:
@@ -428,7 +599,7 @@ def extract_url_params(url: str) -> Dict[str, Any]:
         return {}
 
 
-async def fetch_offers_api(page, api_params: Dict[str, Any], offset: int, max_retries: int = 3) -> Dict[str, Any]:
+async def fetch_offers_api(page, api_params: Dict[str, Any], offset: int, max_retries: int = FETCH_OFFERS_MAX_RETRIES) -> Dict[str, Any]:
     """
     Выполняет fetch запрос к API Domclick через page.evaluate().
     Возвращает ответ API или None при ошибке.
@@ -1022,12 +1193,29 @@ async def run() -> None:
 
                 # Извлекаем параметры из URL
                 api_params = extract_url_params(base_url)
+                complex_only_mode = False
+                normalized_complex_url = None
+
                 if not api_params:
-                    print(f"Не удалось извлечь параметры из URL: {base_url}. Пропускаю.")
-                    url_index += 1
-                    offset = 0
-                    save_progress(url_index, offset, str(PROGRESS_FILE))
-                    continue
+                    if is_complex_url(base_url):
+                        complex_only_mode = True
+                        normalized_complex_url = normalize_complex_url(base_url)
+                        logger.info(f"→ URL без параметров, обрабатываю как страницу ЖК: {normalized_complex_url}")
+                    else:
+                        print(f"Не удалось извлечь параметры из URL: {base_url}. Пропускаю.")
+                        url_index += 1
+                        offset = 0
+                        save_progress(url_index, offset, str(PROGRESS_FILE))
+                        continue
+
+                complex_href_from_params = derive_complex_href_from_params(api_params)
+
+                aggregated_address = None
+                aggregated_complex_name = None
+                aggregated_complex_href = None
+                aggregated_latitude = None
+                aggregated_longitude = None
+                aggregated_offers: Dict[str, Any] = {}
 
                 # Открываем страницу из файла для установки cookies и контекста браузера
                 try:
@@ -1037,68 +1225,103 @@ async def run() -> None:
                         {"timeout": 30000}
                     )
                     await asyncio.sleep(3)
+                    # Проверяем на бан и перезапускаем браузер при необходимости
+                    was_banned, browser, page = await check_ban_and_restart(page, browser)
+                    if was_banned:
+                        # После перезапуска нужно снова открыть страницу
+                        await page.goto(base_url, timeout=120000, waitUntil='networkidle0')
+                        await page.waitForFunction(
+                            "() => document.readyState === 'complete'",
+                            {"timeout": 30000}
+                        )
+                        await asyncio.sleep(3)
                 except Exception:
                     pass  # Пробуем продолжить без открытия страницы
 
-                # Делаем первый запрос для определения общего количества результатов
-                attempts = 0
-                browser_restart_count = 0
-                max_browser_restarts = 2  # Максимум 2 перезапуска браузера на URL
-                first_api_response = None
+                if not complex_only_mode:
+                    # Делаем первый запрос для определения общего количества результатов
+                    attempts = 0
+                    browser_restart_count = 0
+                    max_browser_restarts = 2  # Максимум 2 перезапуска браузера на URL
+                    first_api_response = None
 
-                while attempts < 3 and browser_restart_count < max_browser_restarts:
-                    try:
-                        # Проверяем, что браузер и страница еще живы
-                        page_closed = False
+                    while attempts < FIRST_PAGE_FETCH_ATTEMPTS and browser_restart_count < max_browser_restarts:
                         try:
-                            if page and not page.isClosed():
-                                ready_state = await page.evaluate("() => document.readyState")
-                                if ready_state != 'complete':
-                                    await page.waitForFunction(
-                                        "() => document.readyState === 'complete'",
-                                        {"timeout": 30000}
-                                    )
-                                    await asyncio.sleep(2)
-                            else:
-                                page_closed = True
-                        except Exception as check_error:
-                            error_str = str(check_error).lower()
-                            if 'session closed' in error_str or 'target closed' in error_str or 'page closed' in error_str:
-                                page_closed = True
-                            else:
+                            # Проверяем, что браузер и страница еще живы
+                            page_closed = False
+                            try:
+                                if page and not page.isClosed():
+                                    ready_state = await page.evaluate("() => document.readyState")
+                                    if ready_state != 'complete':
+                                        await page.waitForFunction(
+                                            "() => document.readyState === 'complete'",
+                                            {"timeout": 30000}
+                                        )
+                                        await asyncio.sleep(2)
+                                else:
+                                    page_closed = True
+                            except Exception as check_error:
+                                error_str = str(check_error).lower()
+                                if 'session closed' in error_str or 'target closed' in error_str or 'page closed' in error_str:
+                                    page_closed = True
+                                else:
+                                    try:
+                                        await page.goto(base_url, timeout=120000, waitUntil='networkidle0')
+                                        await page.waitForFunction(
+                                            "() => document.readyState === 'complete'",
+                                            {"timeout": 30000}
+                                        )
+                                        await asyncio.sleep(3)
+                                    except Exception:
+                                        page_closed = True
+
+                            # Если страница закрыта, перезапускаем браузер
+                            if page_closed:
+                                if browser_restart_count >= max_browser_restarts:
+                                    print(f"  ✗ Достигнут лимит перезапусков браузера, пропускаю URL")
+                                    try:
+                                        if browser:
+                                            await browser.close()
+                                    except Exception:
+                                        pass
+                                    first_api_response = None
+                                    break
+
+                                browser_restart_count += 1
                                 try:
+                                    browser, page, _ = await restart_browser(browser, headless=False)
                                     await page.goto(base_url, timeout=120000, waitUntil='networkidle0')
                                     await page.waitForFunction(
                                         "() => document.readyState === 'complete'",
                                         {"timeout": 30000}
                                     )
                                     await asyncio.sleep(3)
-                                except Exception:
-                                    page_closed = True
+                                    attempts = 0
+                                except Exception as restart_error:
+                                    if browser_restart_count >= max_browser_restarts:
+                                        print(f"  ✗ Достигнут лимит перезапусков браузера, пропускаю URL")
+                                        try:
+                                            if browser:
+                                                await browser.close()
+                                        except Exception:
+                                            pass
+                                        first_api_response = None
+                                        break
+                                    await asyncio.sleep(5)
+                                    continue
 
-                        # Если страница закрыта, перезапускаем браузер
-                        if page_closed:
-                            if browser_restart_count >= max_browser_restarts:
-                                print(f"  ✗ Достигнут лимит перезапусков браузера, пропускаю URL")
-                                try:
-                                    if browser:
-                                        await browser.close()
-                                except Exception:
-                                    pass
-                                first_api_response = None
+                            first_api_response = await fetch_offers_api(page, api_params, 0, max_retries=FETCH_OFFERS_MAX_RETRIES)
+                            if first_api_response and 'items' in first_api_response:
                                 break
+                            attempts += 1
+                            if attempts < FIRST_PAGE_FETCH_ATTEMPTS:
+                                await asyncio.sleep(2)
+                        except Exception as e:
+                            error_str = str(e).lower()
+                            attempts += 1
 
-                            browser_restart_count += 1
-                            try:
-                                browser, page, _ = await restart_browser(browser, headless=False)
-                                await page.goto(base_url, timeout=120000, waitUntil='networkidle0')
-                                await page.waitForFunction(
-                                    "() => document.readyState === 'complete'",
-                                    {"timeout": 30000}
-                                )
-                                await asyncio.sleep(3)
-                                attempts = 0
-                            except Exception as restart_error:
+                            # Если ошибка связана с закрытой сессией, перезапускаем браузер
+                            if 'session closed' in error_str or 'target closed' in error_str or 'page closed' in error_str:
                                 if browser_restart_count >= max_browser_restarts:
                                     print(f"  ✗ Достигнут лимит перезапусков браузера, пропускаю URL")
                                     try:
@@ -1108,60 +1331,44 @@ async def run() -> None:
                                         pass
                                     first_api_response = None
                                     break
-                                await asyncio.sleep(5)
-                                continue
 
-                        first_api_response = await fetch_offers_api(page, api_params, 0, max_retries=3)
-                        if first_api_response and 'items' in first_api_response:
-                            break
-                        attempts += 1
-                        if attempts < 3:
-                            await asyncio.sleep(2)
-                    except Exception as e:
-                        error_str = str(e).lower()
-                        attempts += 1
-
-                        # Если ошибка связана с закрытой сессией, перезапускаем браузер
-                        if 'session closed' in error_str or 'target closed' in error_str or 'page closed' in error_str:
-                            if browser_restart_count >= max_browser_restarts:
-                                print(f"  ✗ Достигнут лимит перезапусков браузера, пропускаю URL")
-                                try:
-                                    if browser:
-                                        await browser.close()
-                                except Exception:
-                                    pass
-                                first_api_response = None
-                                break
-
-                            browser_restart_count += 1
-                            try:
-                                browser, page, _ = await restart_browser(browser, headless=False)
-                                await page.goto(base_url, timeout=120000, waitUntil='networkidle0')
-                                await page.waitForFunction(
-                                    "() => document.readyState === 'complete'",
-                                    {"timeout": 30000}
-                                )
-                                await asyncio.sleep(3)
-                                attempts = 0
-                            except Exception:
-                                if browser_restart_count >= max_browser_restarts:
-                                    print(f"  ✗ Достигнут лимит перезапусков браузера, пропускаю URL")
-                                    try:
-                                        if browser:
-                                            await browser.close()
-                                    except Exception:
-                                        pass
-                                    first_api_response = None
-                                    break
-                                await asyncio.sleep(5)
-                                continue
-                        elif attempts >= 3:
-                            if browser_restart_count < max_browser_restarts:
                                 browser_restart_count += 1
                                 try:
                                     browser, page, _ = await restart_browser(browser, headless=False)
+                                    await page.goto(base_url, timeout=120000, waitUntil='networkidle0')
+                                    await page.waitForFunction(
+                                        "() => document.readyState === 'complete'",
+                                        {"timeout": 30000}
+                                    )
+                                    await asyncio.sleep(3)
                                     attempts = 0
                                 except Exception:
+                                    if browser_restart_count >= max_browser_restarts:
+                                        print(f"  ✗ Достигнут лимит перезапусков браузера, пропускаю URL")
+                                        try:
+                                            if browser:
+                                                await browser.close()
+                                        except Exception:
+                                            pass
+                                        first_api_response = None
+                                        break
+                                    await asyncio.sleep(5)
+                                    continue
+                            elif attempts >= FIRST_PAGE_FETCH_ATTEMPTS:
+                                if browser_restart_count < max_browser_restarts:
+                                    browser_restart_count += 1
+                                    try:
+                                        browser, page, _ = await restart_browser(browser, headless=False)
+                                        attempts = 0
+                                    except Exception:
+                                        try:
+                                            if browser:
+                                                await browser.close()
+                                        except Exception:
+                                            pass
+                                        first_api_response = None
+                                        break
+                                else:
                                     try:
                                         if browser:
                                             await browser.close()
@@ -1170,180 +1377,131 @@ async def run() -> None:
                                     first_api_response = None
                                     break
                             else:
-                                try:
-                                    if browser:
-                                        await browser.close()
-                                except Exception:
-                                    pass
-                                first_api_response = None
+                                await asyncio.sleep(2)
+
+                    if not first_api_response:
+                        print(f"  ✗ Не удалось получить данные из API, пропускаю URL")
+                        url_index += 1
+                        offset = 0
+                        save_progress(url_index, offset, str(PROGRESS_FILE))
+                        continue
+
+                    # Определяем общее количество результатов и страниц
+                    total = first_api_response.get('total', 0)
+                    items_count = len(first_api_response.get('items', []))
+                    limit = int(api_params.get('limit', 20))
+
+                    # Если total=0, но есть items, используем количество items как индикатор
+                    if total == 0 and items_count > 0:
+                        total = items_count + 1  # Чтобы цикл выполнился хотя бы один раз
+
+                    total_pages = max(1, (total + limit - 1) // limit) if total > 0 else 1
+                    print(f"  Всего результатов: {total}, страниц: {total_pages}")
+
+                    # Обрабатываем первый ответ
+                    first_data = process_api_response(first_api_response)
+                    aggregated_address = first_data.get('address')
+                    aggregated_complex_name = first_data.get('complexName')
+                    aggregated_complex_href = first_data.get('complexHref') or complex_href_from_params
+                    aggregated_latitude = first_data.get('latitude')
+                    aggregated_longitude = first_data.get('longitude')
+                    aggregated_offers = first_data.get('offers', {})
+
+                    # Обрабатываем остальные страницы
+                    current_offset = limit
+                    # Если total был установлен искусственно (из-за total=0), используем другой подход
+                    if total == items_count + 1:
+                        # Запрашиваем пока есть данные
+                        while True:
+                            api_response = await fetch_offers_api(page, api_params, current_offset, max_retries=FETCH_OFFERS_MAX_RETRIES)
+
+                            if api_response and 'items' in api_response:
+                                response_items = api_response.get('items', [])
+                                if not response_items:
+                                    break
+
+                                data = process_api_response(api_response)
+                                offers = data.get('offers', {})
+
+                                # Объединяем группы офферов
+                                for group, cards in offers.items():
+                                    if group not in aggregated_offers:
+                                        aggregated_offers[group] = []
+                                    aggregated_offers[group].extend(cards)
+
+                                offset = current_offset + limit
+                                save_progress(url_index, offset, str(PROGRESS_FILE))
+
+                                # Если получили меньше limit элементов, значит это последняя страница
+                                if len(response_items) < limit:
+                                    break
+                            else:
                                 break
-                        else:
-                            await asyncio.sleep(2)
 
-                if not first_api_response:
-                    print(f"  ✗ Не удалось получить данные из API, пропускаю URL")
-                    url_index += 1
-                    offset = 0
-                    save_progress(url_index, offset, str(PROGRESS_FILE))
-                    continue
-
-                # Определяем общее количество результатов и страниц
-                total = first_api_response.get('total', 0)
-                items_count = len(first_api_response.get('items', []))
-                limit = int(api_params.get('limit', 20))
-
-                # Если total=0, но есть items, используем количество items как индикатор
-                if total == 0 and items_count > 0:
-                    total = items_count + 1  # Чтобы цикл выполнился хотя бы один раз
-
-                total_pages = max(1, (total + limit - 1) // limit) if total > 0 else 1
-                print(f"  Всего результатов: {total}, страниц: {total_pages}")
-
-                # Обрабатываем первый ответ
-                first_data = process_api_response(first_api_response)
-                aggregated_address = first_data.get('address')
-                aggregated_complex_name = first_data.get('complexName')
-                aggregated_complex_href = first_data.get('complexHref')
-                aggregated_latitude = first_data.get('latitude')
-                aggregated_longitude = first_data.get('longitude')
-                aggregated_offers = first_data.get('offers', {})
-
-                # Обрабатываем остальные страницы
-                current_offset = limit
-                # Если total был установлен искусственно (из-за total=0), используем другой подход
-                if total == items_count + 1:
-                    # Запрашиваем пока есть данные
-                    while True:
-                        api_response = await fetch_offers_api(page, api_params, current_offset, max_retries=3)
-
-                        if api_response and 'items' in api_response:
-                            response_items = api_response.get('items', [])
-                            if not response_items:
-                                break
-
-                            data = process_api_response(api_response)
-                            offers = data.get('offers', {})
-
-                            # Объединяем группы офферов
-                            for group, cards in offers.items():
-                                if group not in aggregated_offers:
-                                    aggregated_offers[group] = []
-                                aggregated_offers[group].extend(cards)
-
-                            offset = current_offset + limit
-                            save_progress(url_index, offset, str(PROGRESS_FILE))
-
-                            # Если получили меньше limit элементов, значит это последняя страница
-                            if len(response_items) < limit:
-                                break
-                        else:
-                            break
-
-                        await asyncio.sleep(3)
-                        current_offset += limit
-                else:
-                    # Обычный случай: total известен
-                    while current_offset < total:
-                        api_response = await fetch_offers_api(page, api_params, current_offset, max_retries=3)
-
-                        if api_response and 'items' in api_response:
-                            data = process_api_response(api_response)
-                            offers = data.get('offers', {})
-
-                            # Объединяем группы офферов
-                            for group, cards in offers.items():
-                                if group not in aggregated_offers:
-                                    aggregated_offers[group] = []
-                                aggregated_offers[group].extend(cards)
-
-                            offset = current_offset + limit
-                            save_progress(url_index, offset, str(PROGRESS_FILE))
-
-                        if current_offset + limit < total:
                             await asyncio.sleep(3)
+                            current_offset += limit
+                    else:
+                        # Обычный случай: total известен
+                        while current_offset < total:
+                            api_response = await fetch_offers_api(page, api_params, current_offset, max_retries=FETCH_OFFERS_MAX_RETRIES)
 
-                        current_offset += limit
+                            if api_response and 'items' in api_response:
+                                data = process_api_response(api_response)
+                                offers = data.get('offers', {})
+
+                                # Объединяем группы офферов
+                                for group, cards in offers.items():
+                                    if group not in aggregated_offers:
+                                        aggregated_offers[group] = []
+                                    aggregated_offers[group].extend(cards)
+
+                                offset = current_offset + limit
+                                save_progress(url_index, offset, str(PROGRESS_FILE))
+
+                            if current_offset + limit < total:
+                                await asyncio.sleep(3)
+
+                            current_offset += limit
+                else:
+                    aggregated_complex_href = normalized_complex_url or base_url
+
+                # Попытаемся собрать галерею ЖК с текущей страницы до переходов
+                complex_gallery_images: List[str] = await extract_gallery_images(page)
+                if complex_gallery_images:
+                    logger.info(f"  Галерея (текущая страница): найдено {len(complex_gallery_images)} исходных фото")
+                else:
+                    logger.info("  На текущей странице галерея не найдена")
 
                 # Для получения фотографий ЖК и ссылки на ход строительства нужно открыть страницу комплекса
-                complex_gallery_images: List[str] = []
                 aggregated_hod_url: str = None
                 construction_progress_data: Dict[str, Any] = None
 
                 if aggregated_complex_href:
                     try:
                         await page.goto(aggregated_complex_href, timeout=120000)
+                        await asyncio.sleep(2)
+                        # Проверяем на бан и перезапускаем браузер при необходимости
+                        was_banned, browser, page = await check_ban_and_restart(page, browser)
+                        if was_banned:
+                            # После перезапуска нужно снова открыть страницу
+                            await page.goto(aggregated_complex_href, timeout=120000)
+                            await asyncio.sleep(2)
+                        try:
+                            await page.waitForSelector('[data-e2e-id="complex-header-gallery"]', {"timeout": 15000})
+                        except Exception:
+                            logger.warning("  Галерея не появилась за 15 секунд")
                         await asyncio.sleep(3)
 
-                        # Извлекаем фотографии ЖК из галереи
-                        try:
-                            complex_photos_data = await page.evaluate("""
-                            () => {
-                              const complexPhotos = [];
-
-                              // Пробуем разные селекторы для галереи
-                              let galleryContainer = document.querySelector('[data-e2e-id="complex-header-gallery"]');
-                              if (!galleryContainer) {
-                                galleryContainer = document.querySelector('[data-e2e-id*="gallery"]');
-                              }
-                              if (!galleryContainer) {
-                                galleryContainer = document.querySelector('.gallery, [class*="gallery"], [class*="Gallery"]');
-                              }
-
-                              if (galleryContainer) {
-                                // Пробуем разные селекторы для изображений
-                                let imageElements = galleryContainer.querySelectorAll('[data-e2e-id^="complex-header-gallery-image__"]');
-                                if (imageElements.length === 0) {
-                                  imageElements = galleryContainer.querySelectorAll('img');
-                                }
-
-                                imageElements.forEach((element, idx) => {
-                                  // Пробуем разные способы получения изображения
-                                  let img = element;
-                                  if (element.tagName !== 'IMG') {
-                                    img = element.querySelector('img');
-                                  }
-
-                                  if (!img) {
-                                    // Пробуем найти img внутри элемента
-                                    img = element.querySelector('img.picture-image-object-fit--cover-820-5-0-5.picture-imageFillingContainer-4a2-5-0-5');
-                                  }
-                                  if (!img) {
-                                    // Пробуем любой img
-                                    img = element.querySelector('img');
-                                  }
-
-                                  if (img) {
-                                    // Пробуем разные атрибуты для получения URL
-                                    let imgUrl = img.src || img.getAttribute('src') || img.getAttribute('data-src') ||
-                                               img.getAttribute('data-lazy') || img.getAttribute('data-original');
-
-                                    if (imgUrl) {
-                                      try {
-                                        const absoluteUrl = new URL(imgUrl, location.origin).href;
-                                        // Фильтруем только реальные изображения
-                                        if (/\.(jpg|jpeg|png|webp)/i.test(absoluteUrl) || absoluteUrl.includes('img.dmclk.ru') || absoluteUrl.includes('vitrina')) {
-                                          complexPhotos.push(absoluteUrl);
-                                        }
-                                      } catch (e) {
-                                        if (imgUrl.startsWith('http')) {
-                                          complexPhotos.push(imgUrl);
-                                        }
-                                      }
-                                    }
-                                  }
-                                });
-                              }
-
-                              return complexPhotos;
-                            }
-                            """)
-                            complex_gallery_images = complex_photos_data or []
-                        except Exception:
-                            pass
+                        if not complex_gallery_images:
+                            complex_gallery_images = await extract_gallery_images(page)
+                            if complex_gallery_images:
+                                logger.info(f"  Галерея ЖК: найдено {len(complex_gallery_images)} исходных фото")
+                            else:
+                                logger.info("  Галерея ЖК на странице комплекса не найдена")
 
                         # Сохраняем ссылку на страницу "О ЖК" для хода строительства
                         try:
-                            about_href = await page.evaluate("""
+                            about_href = await page.evaluate(r"""
                             () => {
                               let a = document.querySelector('[data-e2e-id="complex-header-about"]');
 
@@ -1415,9 +1573,12 @@ async def run() -> None:
                 if complex_gallery_images:
                     try:
                         complex_photos_urls = await process_complex_photos(complex_gallery_images, complex_id)
+                        logger.info(f"  Фото ЖК загружены: {len(complex_photos_urls)} файлов")
                     except Exception as e:
                         logger.error(f"Ошибка при обработке фотографий ЖК: {e}")
                         complex_photos_urls = []
+                else:
+                    logger.info("  Галерея ЖК пуста — ничего не загружаю")
 
                 # Обрабатываем фотографии всех квартир и загружаем в S3
                 processed_apartment_types = aggregated_offers or {}
@@ -1440,6 +1601,11 @@ async def run() -> None:
                         attempt_hod += 1
                         try:
                             stages_data = await extract_construction_from_domclick(page, aggregated_hod_url)
+                            # Проверяем на бан после перехода на страницу хода строительства
+                            was_banned, browser, page = await check_ban_and_restart(page, browser)
+                            if was_banned:
+                                # После перезапуска нужно снова открыть страницу
+                                stages_data = await extract_construction_from_domclick(page, aggregated_hod_url)
                             if stages_data and stages_data.get('construction_stages'):
                                 construction_progress_data = await process_construction_stages_domclick(stages_data['construction_stages'], complex_id)
                                 break

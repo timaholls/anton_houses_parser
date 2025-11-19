@@ -5,7 +5,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from browser_manager import setup_stealth_browser, create_new_tab
+from browser_manager import setup_stealth_browser
 
 # Директория текущего скрипта
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -95,43 +95,16 @@ async def fetch_all_houses():
             browser, page1 = await setup_stealth_browser()
             print("Страница браузера создана с антидетект-настройками из open_browser.py")
 
-            # Загружаем первую страницу и дождемся её полной загрузки
+            # Загружаем страницу каталога
             try:
                 await page1.goto(
-                    "https://наш.дом.рф/сервисы/каталог-новостроек/список-объектов/список"
-                    "?objStatus=0&search=уфа&residentialBuildings=1",
+                    "https://наш.дом.рф/новостройки/строящиеся/уфа/?objStatus=0&residentialBuildings=1",
                     {'waitUntil': 'networkidle2', 'timeout': 30000})
                 await asyncio.sleep(3)  # Дополнительная пауза для стабилизации страницы
-                print("✅ Первая страница успешно загружена")
+                print("✅ Страница каталога успешно загружена")
             except Exception as e:
                 error_message = str(e)
-                print(f"⚠️ Ошибка при загрузке первой страницы: {error_message}")
-
-                # Проверяем, является ли это сетевой ошибкой или ошибкой прокси
-                is_network_error = any(err in error_message for err in ['ERR_', 'net::', 'timeout', 'Navigation', 'Connection', 'PROXY'])
-                if is_network_error:
-                    print("🔄 Обнаружена сетевая/прокси ошибка! Перезапускаем с новым прокси...")
-                    await asyncio.sleep(2)
-
-                if browser:
-                    await browser.close()
-                continue
-
-            # Создаем вторую вкладку
-            page2 = await create_new_tab(browser)
-            print("Вторая вкладка создана")
-
-            # Загрузим вторую страницу с полным ожиданием загрузки
-            try:
-                print("Переход во второй вкладке")
-                await asyncio.sleep(5)
-                await page2.goto(
-                    "https://наш.дом.рф/сервисы/каталог-новостроек/список-объектов/список?objStatus=0&search=уфа&residentialBuildings=1",
-                    {'waitUntil': 'networkidle2', 'timeout': 30000})
-                print("✅ Вторая вкладка загружена")
-            except Exception as e:
-                error_message = str(e)
-                print(f"⚠️ Ошибка при загрузке второй вкладки: {error_message}")
+                print(f"⚠️ Ошибка при загрузке страницы каталога: {error_message}")
 
                 # Проверяем, является ли это сетевой ошибкой или ошибкой прокси
                 is_network_error = any(err in error_message for err in ['ERR_', 'net::', 'timeout', 'Navigation', 'Connection', 'PROXY'])
@@ -146,14 +119,14 @@ async def fetch_all_houses():
             try:
                 element_found = False
                 try:
-                    await page2.waitForSelector('button:has-text("Показать ещё")', {'timeout': 20000})
+                    await page1.waitForSelector('button:has-text("Показать ещё")', {'timeout': 20000})
                     element_found = True
                 except Exception:
                     print("Кнопка 'Показать ещё' не найдена, ищем другие элементы...")
 
                 if not element_found:
                     try:
-                        await page2.waitForSelector('[class*="NewBuildingItem__Wrapper"]', {'timeout': 20000})
+                        await page1.waitForSelector('[class*="NewBuildingItem__Wrapper"]', {'timeout': 20000})
                         element_found = True
                     except Exception as e:
                         print(f"Элементы новостроек не найдены: {e}")
@@ -161,7 +134,7 @@ async def fetch_all_houses():
                 if not element_found:
                     try:
                         # Проверяем капчу
-                        captcha_text = await page2.evaluate('''() => {
+                        captcha_text = await page1.evaluate('''() => {
                             return document.body.innerText.includes("Нам очень жаль, но запросы с вашего устройства похожи на автоматические");
                         }''')
 
@@ -197,7 +170,7 @@ async def fetch_all_houses():
                 params = PARAMS.copy()
                 params['offset'] = offset
                 try:
-                    data = await fetch_api_in_browser(page2, params)
+                    data = await fetch_api_in_browser(page1, params)
                     api_errors = 0  # Сбрасываем счетчик ошибок при успешном запросе
                 except Exception as e:
                     api_errors += 1

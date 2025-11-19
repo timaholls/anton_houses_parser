@@ -187,7 +187,8 @@ async def check_ban_and_restart(page, browser, max_restarts: int = 3) -> Tuple[b
     Возвращает (was_banned, browser, page) - был ли бан и обновленные browser/page.
     """
     try:
-        html_content = await page.content()
+        # Добавляем таймаут для page.content() чтобы избежать зависаний
+        html_content = await asyncio.wait_for(page.content(), timeout=10.0)
         if "Похоже, ваш запрос выглядит" in html_content:
             logger.warning("  ⚠️ Обнаружен бан! Перезапускаю браузер с новым прокси...")
             for restart_attempt in range(max_restarts):
@@ -213,7 +214,8 @@ async def extract_gallery_images(page) -> List[str]:
     Возвращает список URL изображений галереи с текущей открытой страницы.
     """
     try:
-        data = await page.evaluate(r"""
+        # Добавляем таймаут для page.evaluate() чтобы избежать зависаний
+        data = await asyncio.wait_for(page.evaluate(r"""
         () => {
           const complexPhotos = [];
 
@@ -286,9 +288,11 @@ async def extract_gallery_images(page) -> List[str]:
 
           return complexPhotos;
         }
-        """)
+        """), timeout=10.0)
         if isinstance(data, list):
             return [str(url) for url in data if isinstance(url, str) and url]
+    except asyncio.TimeoutError:
+        logger.warning(f"  Таймаут при чтении галереи (evaluate), продолжаю")
     except Exception as error:
         logger.warning(f"  Не удалось прочитать галерею (evaluate): {error}")
     return []
@@ -299,27 +303,31 @@ async def extract_construction_from_domclick(page, hod_url: str) -> Dict[str, An
     Возвращает { construction_stages: [{stage_number, date, photos: [urls<=5]}] }.
     """
     try:
-        await page.goto(hod_url, timeout=120000, waitUntil='networkidle0')
+        await page.goto(hod_url, timeout=60000, waitUntil='load')
         await asyncio.sleep(3)
 
-        # Клик по бейджу и по чекбоксу "2025" в ОДНОМ evaluate (с задержками)
+        # Клик по бейджу и по чекбоксу (2025 или первый элемент) в ОДНОМ evaluate (с задержками)
         try:
-            clicked_2025 = await page.evaluate(r"""
+            clicked_filter = await asyncio.wait_for(page.evaluate(r"""
             async () => {
               const sleep = (ms) => new Promise(r => setTimeout(r, ms));
               // 1) Клик по бейджу
               const badge = document.querySelector('[data-badge="true"]');
               if (badge) { badge.click(); await sleep(300); }
 
-              // 2) Находим опцию 2025
+              // 2) Находим опцию 2025 или берем первую опцию
               const normalize = (s) => String(s || '').replace(/\s+/g, ' ').trim();
               const options = Array.from(document.querySelectorAll('[role="option"], [aria-selected]'));
-              const opt2025 = options.find(el => /\b2025\b/.test(normalize(el.textContent)));
-              if (!opt2025) return false;
+              let targetOption = options.find(el => /\b2025\b/.test(normalize(el.textContent)));
+              // Если не найден 2025, берем первый элемент (обычно он уже выбран)
+              if (!targetOption && options.length > 0) {
+                targetOption = options[0];
+              }
+              if (!targetOption) return false;
 
               // 3) Ищем кликабельный элемент
-              const checkbox = opt2025.querySelector('input[type="checkbox"]');
-              const target = checkbox || opt2025.querySelector('label, [role="checkbox"], .checkbox-root, .list-cell-root, span[tabindex], div[tabindex]') || opt2025;
+              const checkbox = targetOption.querySelector('input[type="checkbox"]');
+              const target = checkbox || targetOption.querySelector('label, [role="checkbox"], .checkbox-root, .list-cell-root, span[tabindex], div[tabindex]') || targetOption;
 
               // 4) Эмуляция клика
               const fire = (type, el) => el && el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
@@ -332,9 +340,11 @@ async def extract_construction_from_domclick(page, hod_url: str) -> Dict[str, An
               await sleep(220);
               return target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
             }
-            """)
-            if clicked_2025:
+            """), timeout=10.0)
+            if clicked_filter:
                 await asyncio.sleep(1200/1000)
+        except asyncio.TimeoutError:
+            pass
         except Exception:
             pass
 
@@ -439,7 +449,7 @@ async def extract_construction_from_domclick(page, hod_url: str) -> Dict[str, An
 
     try:
         # Определяем количество страниц
-        pages_count = await page.evaluate("""
+        pages_count = await asyncio.wait_for(page.evaluate("""
         () => {
           const pag = document.querySelector('[data-testid="construction-progress-pagination"]');
           if (!pag) return 1;
@@ -448,26 +458,28 @@ async def extract_construction_from_domclick(page, hod_url: str) -> Dict[str, An
             .filter(n => Number.isFinite(n));
           return Math.max(1, ...(nums.length ? nums : [1]));
         }
-        """)
+        """), timeout=10.0)
         if not isinstance(pages_count, (int, float)) or pages_count < 1:
             pages_count = 1
 
         for page_index in range(1, int(pages_count) + 1):
             try:
-                data = await page.evaluate(eval_script)
+                data = await asyncio.wait_for(page.evaluate(eval_script), timeout=15.0)
                 
                 if isinstance(data, list):
                     merge_pages(data)
-                elif isinstance(data, dict):
+                if isinstance(data, dict):
                     stages_list = data.get('stages') or data.get('construction_stages') or []
                     merge_pages(stages_list)
+            except asyncio.TimeoutError:
+                pass
             except Exception:
                 pass
 
             # Кликаем следующую страницу, если есть
             if page_index < pages_count:
                 try:
-                    clicked = await page.evaluate("""
+                    clicked = await asyncio.wait_for(page.evaluate("""
                     (n) => {
                       const pag = document.querySelector('[data-testid="construction-progress-pagination"]');
                       if (!pag) return false;
@@ -476,9 +488,11 @@ async def extract_construction_from_domclick(page, hod_url: str) -> Dict[str, An
                       if (btn) { btn.click(); return true; }
                       return false;
                     }
-                    """, page_index + 1)
+                    """, page_index + 1), timeout=10.0)
                     if clicked:
                         await asyncio.sleep(2)
+                except asyncio.TimeoutError:
+                    pass
                 except Exception:
                     pass
 
@@ -657,7 +671,8 @@ async def fetch_offers_api(page, api_params: Dict[str, Any], offset: int, max_re
     
     for attempt in range(1, max_retries + 1):
         try:
-            result = await page.evaluate(script, api_url)
+            # Добавляем таймаут для page.evaluate() чтобы избежать зависаний
+            result = await asyncio.wait_for(page.evaluate(script, api_url), timeout=30.0)
             if isinstance(result, dict):
                 if 'error' in result:
                     if attempt < max_retries:
@@ -678,6 +693,12 @@ async def fetch_offers_api(page, api_params: Dict[str, Any], offset: int, max_re
                     await asyncio.sleep(2 * attempt)
                     continue
                 return None
+        except asyncio.TimeoutError:
+            logger.warning(f"  Таймаут при запросе к API (попытка {attempt}/{max_retries})")
+            if attempt < max_retries:
+                await asyncio.sleep(2 * attempt)
+                continue
+            return None
         except Exception as e:
             if attempt < max_retries:
                 await asyncio.sleep(2 * attempt)
@@ -1219,24 +1240,25 @@ async def run() -> None:
 
                 # Открываем страницу из файла для установки cookies и контекста браузера
                 try:
-                    await page.goto(base_url, timeout=120000, waitUntil='networkidle0')
-                    await page.waitForFunction(
-                        "() => document.readyState === 'complete'",
-                        {"timeout": 30000}
-                    )
+                    # Используем 'load' вместо 'networkidle0' чтобы избежать зависаний на аналитике/рекламе
+                    await page.goto(base_url, timeout=60000, waitUntil='load')
                     await asyncio.sleep(3)
                     # Проверяем на бан и перезапускаем браузер при необходимости
                     was_banned, browser, page = await check_ban_and_restart(page, browser)
                     if was_banned:
                         # После перезапуска нужно снова открыть страницу
-                        await page.goto(base_url, timeout=120000, waitUntil='networkidle0')
-                        await page.waitForFunction(
-                            "() => document.readyState === 'complete'",
-                            {"timeout": 30000}
-                        )
+                        await page.goto(base_url, timeout=60000, waitUntil='load')
+                        try:
+                            await page.waitForFunction(
+                                "() => document.readyState === 'complete'",
+                                {"timeout": 20000}
+                            )
+                        except Exception:
+                            pass  # Продолжаем даже если readyState не complete
                         await asyncio.sleep(3)
-                except Exception:
-                    pass  # Пробуем продолжить без открытия страницы
+                except Exception as goto_error:
+                    logger.warning(f"  Предупреждение при открытии страницы: {goto_error}")
+                    # Пробуем продолжить без открытия страницы
 
                 if not complex_only_mode:
                     # Делаем первый запрос для определения общего количества результатов
@@ -1251,12 +1273,18 @@ async def run() -> None:
                             page_closed = False
                             try:
                                 if page and not page.isClosed():
-                                    ready_state = await page.evaluate("() => document.readyState")
+                                    try:
+                                        ready_state = await asyncio.wait_for(page.evaluate("() => document.readyState"), timeout=5.0)
+                                    except asyncio.TimeoutError:
+                                        ready_state = 'loading'
                                     if ready_state != 'complete':
-                                        await page.waitForFunction(
-                                            "() => document.readyState === 'complete'",
-                                            {"timeout": 30000}
-                                        )
+                                        try:
+                                            await page.waitForFunction(
+                                                "() => document.readyState === 'complete'",
+                                                {"timeout": 20000}
+                                            )
+                                        except Exception:
+                                            pass
                                         await asyncio.sleep(2)
                                 else:
                                     page_closed = True
@@ -1266,11 +1294,14 @@ async def run() -> None:
                                     page_closed = True
                                 else:
                                     try:
-                                        await page.goto(base_url, timeout=120000, waitUntil='networkidle0')
-                                        await page.waitForFunction(
-                                            "() => document.readyState === 'complete'",
-                                            {"timeout": 30000}
-                                        )
+                                        await page.goto(base_url, timeout=60000, waitUntil='load')
+                                        try:
+                                            await page.waitForFunction(
+                                                "() => document.readyState === 'complete'",
+                                                {"timeout": 20000}
+                                            )
+                                        except Exception:
+                                            pass
                                         await asyncio.sleep(3)
                                     except Exception:
                                         page_closed = True
@@ -1290,11 +1321,14 @@ async def run() -> None:
                                 browser_restart_count += 1
                                 try:
                                     browser, page, _ = await restart_browser(browser, headless=False)
-                                    await page.goto(base_url, timeout=120000, waitUntil='networkidle0')
-                                    await page.waitForFunction(
-                                        "() => document.readyState === 'complete'",
-                                        {"timeout": 30000}
-                                    )
+                                    await page.goto(base_url, timeout=60000, waitUntil='load')
+                                    try:
+                                        await page.waitForFunction(
+                                            "() => document.readyState === 'complete'",
+                                            {"timeout": 20000}
+                                        )
+                                    except Exception:
+                                        pass
                                     await asyncio.sleep(3)
                                     attempts = 0
                                 except Exception as restart_error:
@@ -1335,11 +1369,14 @@ async def run() -> None:
                                 browser_restart_count += 1
                                 try:
                                     browser, page, _ = await restart_browser(browser, headless=False)
-                                    await page.goto(base_url, timeout=120000, waitUntil='networkidle0')
-                                    await page.waitForFunction(
-                                        "() => document.readyState === 'complete'",
-                                        {"timeout": 30000}
-                                    )
+                                    await page.goto(base_url, timeout=60000, waitUntil='load')
+                                    try:
+                                        await page.waitForFunction(
+                                            "() => document.readyState === 'complete'",
+                                            {"timeout": 20000}
+                                        )
+                                    except Exception:
+                                        pass
                                     await asyncio.sleep(3)
                                     attempts = 0
                                 except Exception:
@@ -1478,18 +1515,18 @@ async def run() -> None:
 
                 if aggregated_complex_href:
                     try:
-                        await page.goto(aggregated_complex_href, timeout=120000)
+                        await page.goto(aggregated_complex_href, timeout=60000, waitUntil='load')
                         await asyncio.sleep(2)
                         # Проверяем на бан и перезапускаем браузер при необходимости
                         was_banned, browser, page = await check_ban_and_restart(page, browser)
                         if was_banned:
                             # После перезапуска нужно снова открыть страницу
-                            await page.goto(aggregated_complex_href, timeout=120000)
+                            await page.goto(aggregated_complex_href, timeout=60000, waitUntil='load')
                             await asyncio.sleep(2)
                         try:
-                            await page.waitForSelector('[data-e2e-id="complex-header-gallery"]', {"timeout": 15000})
+                            await page.waitForSelector('[data-e2e-id="complex-header-gallery"]', {"timeout": 10000})
                         except Exception:
-                            logger.warning("  Галерея не появилась за 15 секунд")
+                            logger.warning("  Галерея не появилась за 10 секунд, продолжаю")
                         await asyncio.sleep(3)
 
                         if not complex_gallery_images:
@@ -1501,7 +1538,7 @@ async def run() -> None:
 
                         # Сохраняем ссылку на страницу "О ЖК" для хода строительства
                         try:
-                            about_href = await page.evaluate(r"""
+                            about_href = await asyncio.wait_for(page.evaluate(r"""
                             () => {
                               let a = document.querySelector('[data-e2e-id="complex-header-about"]');
 
@@ -1538,7 +1575,7 @@ async def run() -> None:
                               }
                               return null;
                             }
-                            """)
+                            """), timeout=10.0)
                             if about_href:
                                 if '/hod-stroitelstva' in about_href:
                                     aggregated_hod_url = about_href
@@ -1554,6 +1591,14 @@ async def run() -> None:
                                         aggregated_hod_url = aggregated_complex_href + 'hod-stroitelstva'
                                     else:
                                         aggregated_hod_url = aggregated_complex_href + '/hod-stroitelstva'
+                        except asyncio.TimeoutError:
+                            if aggregated_complex_href:
+                                if '/hod-stroitelstva' in aggregated_complex_href:
+                                    aggregated_hod_url = aggregated_complex_href
+                                elif aggregated_complex_href.endswith('/'):
+                                    aggregated_hod_url = aggregated_complex_href + 'hod-stroitelstva'
+                                else:
+                                    aggregated_hod_url = aggregated_complex_href + '/hod-stroitelstva'
                         except Exception:
                             if aggregated_complex_href:
                                 if '/hod-stroitelstva' in aggregated_complex_href:

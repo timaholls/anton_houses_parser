@@ -246,23 +246,16 @@ def rebuild_unified_record(unified_record):
         print(f"❌ Нет исходных записей для unified_record {unified_record['_id']}")
         return None
 
-    # Для координат используем значения из unified_record, но при их отсутствии
-    # пробуем взять координаты из DomClick
+    # Координаты и адреса сохраняем строго из существующих данных unified_record
     latitude = unified_record.get('latitude')
     longitude = unified_record.get('longitude')
-
-    if (latitude is None or longitude is None) and domclick_record:
-        dc_lat = domclick_record.get('latitude')
-        dc_lon = domclick_record.get('longitude')
-        if dc_lat is not None and dc_lon is not None:
-            latitude = dc_lat
-            longitude = dc_lon
 
     if latitude is None or longitude is None:
         print(f"⚠️ Нет координат для записи {unified_record['_id']}")
         return None
 
-    geocoded_address = fetch_address_from_coords(latitude, longitude)
+    # Больше не перезаписываем адреса через геокодер — используем существующие значения
+    geocoded_address = {}
 
     # === ПЕРЕСОЗДАЕМ ЗАПИСЬ С НУЛЯ ПО ТОЧНОЙ ЛОГИКЕ save_manual_match ===
 
@@ -309,20 +302,10 @@ def rebuild_unified_record(unified_record):
         ('address_house', 'house_number'),
     ]
 
-    for field, geo_key in address_fields:
+    for field, _ in address_fields:
         existing_value = unified_record.get(field)
-        new_value = geocoded_address.get(geo_key) if geocoded_address else None
-
-        if field == 'address_full':
-            if new_value:
-                new_record[field] = new_value
-            elif existing_value is not None:
-                new_record[field] = existing_value
-        else:
-            if existing_value is not None:
-                new_record[field] = existing_value
-            elif new_value:
-                new_record[field] = new_value
+        if existing_value is not None:
+            new_record[field] = existing_value
 
     # Проверяем изменения координат
     if unified_record.get('latitude') != latitude or unified_record.get('longitude') != longitude:
@@ -334,9 +317,7 @@ def rebuild_unified_record(unified_record):
         avito_dev = avito_record.get('development', {})
         if isinstance(avito_dev, dict):
             new_name = avito_dev.get('name', '')
-            new_address = geocoded_address.get('full') if geocoded_address else None
-            if not new_address:
-                new_address = new_record.get('address_full') or old_dev.get('address', '')
+            new_address = old_dev.get('address', '') or new_record.get('address_full')
             new_price = avito_dev.get('price_range', '')
             new_korpuses = avito_dev.get('korpuses', [])
 

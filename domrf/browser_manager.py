@@ -56,7 +56,7 @@ async def setup_stealth_browser():
         args=[
             f'--proxy-server={proxy_server}',
             '--no-first-run',
-            '--no-sandbox',
+            #'--no-sandbox',
         ],
         dumpio=False,
         autoClose=False,

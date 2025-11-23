@@ -170,8 +170,24 @@ async def parse_apartment_page(page, apartment_url: str) -> Dict[str, Any]:
                 raise Exception("Страница закрыта, требуется перезапуск браузера")
             raise
         
-        await page.goto(apartment_url, timeout=60000)
-        await asyncio.sleep(3)
+        # Переходим на страницу, ждем только загрузки DOM (не всех ресурсов)
+        await page.goto(apartment_url, timeout=60000, waitUntil='domcontentloaded')
+        
+        # Ждем появления ключевых элементов вместо полной загрузки страницы
+        # Ждем появления хотя бы одного из основных элементов
+        try:
+            # Пробуем дождаться названия или цены (эти элементы появляются первыми)
+            await page.waitForSelector(
+                '[data-name="OfferTitleNew"], [data-name="NewbuildingPriceInfo"]',
+                {'timeout': 15000}
+            )
+        except Exception:
+            # Если не появились, пробуем дождаться галереи
+            try:
+                await page.waitForSelector('[data-name="OfferGallery"]', {'timeout': 10000})
+            except Exception:
+                # Если ничего не появилось, продолжаем - возможно элементы уже есть
+                pass
         
         # Парсим данные через JavaScript
         script = """

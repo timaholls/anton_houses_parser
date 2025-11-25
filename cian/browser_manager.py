@@ -5,7 +5,7 @@ import random
 #EXECUTABLE_PATH = "C:\Program Files\Google\Chrome\Application\chrome.exe"
 EXECUTABLE_PATH = "/usr/bin/google-chrome-stable"
 PROXY_HOST = "192.168.0.148"
-PROXY_PORTS = [3135]
+PROXY_PORTS = [3135, 3136]
 
 # Реальные cookies из браузера
 COOKIES = [
@@ -82,7 +82,7 @@ async def create_browser(headless: bool = False):
             '--disable-gpu',  # Отключаем GPU для стабильности
             '--disable-software-rasterizer',
             '--disable-extensions',
-            f'--proxy-server={proxy_url}',
+            # f'--proxy-server={proxy_url}',
         ]
     )
     return browser, proxy_url

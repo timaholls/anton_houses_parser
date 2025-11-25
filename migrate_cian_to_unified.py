@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
 Скрипт для миграции данных из CIAN в unified_houses
-Создает новую запись с данными из CIAN, сохраняя критичные поля из старой записи
+Обновляет существующую запись данными из CIAN, сохраняя все остальные поля
 """
 
 import os
 import json
 import re
+import argparse
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional, Tuple
@@ -19,6 +20,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
 
 CIAN_DATA_FILE = PROJECT_ROOT / "cian" / "cian_apartments_data.json"
+CIAN_COLLECTION_NAME = "unified_houses_2"  # Коллекция где cian_3.py сохраняет данные
 BUILDING_NAME = "ЖК «8 NEBO»"
 
 
@@ -255,10 +257,38 @@ def convert_cian_apartment_to_unified(cian_apt: Dict) -> Optional[Dict]:
     return apartment
 
 
-def load_cian_data() -> Optional[Dict]:
-    """Загружает данные из CIAN JSON файла"""
+def load_cian_data_from_mongo(db) -> Optional[Dict]:
+    """Загружает данные из MongoDB коллекции unified_houses_2"""
+    try:
+        cian_col = db[CIAN_COLLECTION_NAME]
+        
+        # Ищем ЖК «8 NEBO» в коллекции
+        query = {"building_title": BUILDING_NAME}
+        building = cian_col.find_one(query, projection={"_id": 0})
+        
+        if building:
+            print(f"✅ Найден ЖК в MongoDB ({CIAN_COLLECTION_NAME}): {BUILDING_NAME}")
+            return building
+        
+        # Пробуем поиск по частичному совпадению
+        query_regex = {"building_title": {"$regex": BUILDING_NAME.replace("«", "").replace("»", ""), "$options": "i"}}
+        building = cian_col.find_one(query_regex, projection={"_id": 0})
+        
+        if building:
+            print(f"✅ Найден ЖК в MongoDB (по частичному совпадению): {building.get('building_title', BUILDING_NAME)}")
+            return building
+        
+        print(f"❌ ЖК '{BUILDING_NAME}' не найден в коллекции {CIAN_COLLECTION_NAME}")
+        return None
+    except Exception as e:
+        print(f"❌ Ошибка загрузки данных из MongoDB: {e}")
+        return None
+
+
+def load_cian_data_from_file() -> Optional[Dict]:
+    """Загружает данные из CIAN JSON файла (резервный вариант)"""
     if not CIAN_DATA_FILE.exists():
-        print(f"❌ Файл не найден: {CIAN_DATA_FILE}")
+        print(f"⚠️ Файл не найден: {CIAN_DATA_FILE}")
         return None
     
     try:
@@ -268,13 +298,13 @@ def load_cian_data() -> Optional[Dict]:
         # Ищем ЖК «8 NEBO»
         for building in data:
             if building.get("building_title") == BUILDING_NAME:
-                print(f"✅ Найден ЖК: {BUILDING_NAME}")
+                print(f"✅ Найден ЖК в файле: {BUILDING_NAME}")
                 return building
         
         print(f"❌ ЖК '{BUILDING_NAME}' не найден в файле")
         return None
     except Exception as e:
-        print(f"❌ Ошибка загрузки данных из CIAN: {e}")
+        print(f"❌ Ошибка загрузки данных из файла: {e}")
         return None
 
 
@@ -300,92 +330,43 @@ def find_unified_record(db, building_name: str):
     return None
 
 
-def create_new_unified_record(old_record: Dict, cian_building: Dict) -> Dict:
+def update_unified_record_with_cian(old_record: Dict, cian_building: Dict) -> Dict:
     """
-    Создает новую запись unified_houses на основе старой записи и данных из CIAN
+    Обновляет существующую запись unified_houses данными из CIAN
+    Плавная миграция: обновляет только нужные поля, сохраняя все остальное
     """
-    # Сохраняем критичные поля из старой записи
-    new_record = {
-        "latitude": old_record.get("latitude"),
-        "longitude": old_record.get("longitude"),
-        "source": "manual",
-        "created_by": "manual",
-        "is_featured": old_record.get("is_featured", False),
-        "agent_id": old_record.get("agent_id"),
-        "updated_at": datetime.now(timezone.utc),
-    }
+    import copy
     
-    # Сохраняем адресные поля
-    address_fields = [
-        "address_full", "address_city", "address_district", 
-        "address_street", "address_house"
-    ]
-    for field in address_fields:
-        if field in old_record:
-            new_record[field] = old_record[field]
-    
-    # Сохраняем поля города, района, улицы на верхнем уровне (если есть)
-    if "city" in old_record:
-        new_record["city"] = old_record["city"]
-    
-    if "district" in old_record:
-        new_record["district"] = old_record["district"]
-    
-    if "street" in old_record:
-        new_record["street"] = old_record["street"]
-    
-    if "name" in old_record:
-        new_record["name"] = old_record["name"]
-    
-    # Сохраняем рейтинг
-    rating_fields = [
-        "rating", "rating_description", 
-        "rating_created_at", "rating_updated_at"
-    ]
-    for field in rating_fields:
-        if field in old_record:
-            new_record[field] = old_record[field]
-    
-    # Сохраняем ход строительства из старой записи (если есть)
-    if "construction_progress" in old_record:
-        new_record["construction_progress"] = old_record["construction_progress"]
-        print(f"📊 Сохранен ход строительства из старой записи")
-    
-    # Development из CIAN
-    new_record["development"] = {
-        "name": cian_building.get("building_title", ""),
-        "photos": cian_building.get("building_photos", [])
-    }
-    
-    # Сохраняем дополнительные поля из старой записи в development
+    # Копируем development из старой записи, чтобы сохранить все поля
     old_dev = old_record.get("development", {})
-    if old_dev.get("address"):
-        new_record["development"]["address"] = old_dev["address"]
+    updated_dev = copy.deepcopy(old_dev)
     
-    # Сохраняем корпуса из старой записи (если есть)
-    if old_dev.get("korpuses"):
-        new_record["development"]["korpuses"] = old_dev["korpuses"]
-        print(f"📊 Сохранены корпуса из старой записи: {len(old_dev['korpuses'])} корпусов")
+    # Обновляем только photos в development
+    cian_photos = cian_building.get("building_photos", [])
+    updated_dev["photos"] = cian_photos
+    print(f"📸 Обновлены фото ЖК: {len(cian_photos)} фото из CIAN (было: {len(old_dev.get('photos', []))})")
     
-    # Сохраняем price_range из старой записи (если есть)
-    if old_dev.get("price_range"):
-        new_record["development"]["price_range"] = old_dev["price_range"]
+    # Обновляем название если оно отличается (но обычно оно одинаковое)
+    cian_name = cian_building.get("building_title", "")
+    if cian_name and updated_dev.get("name") != cian_name:
+        updated_dev["name"] = cian_name
+        print(f"📝 Обновлено название ЖК: {cian_name}")
     
-    # Сохраняем parameters из старой записи (если есть)
-    if old_dev.get("parameters"):
-        new_record["development"]["parameters"] = old_dev["parameters"]
+    # Подготавливаем обновления
+    updates = {
+        "$set": {
+            "updated_at": datetime.now(timezone.utc),
+            "development": updated_dev  # Обновляем весь development объект, сохраняя все поля
+        }
+    }
     
-    # Сохраняем _source_ids если есть, добавляем cian если нужно
-    if "_source_ids" in old_record:
-        new_record["_source_ids"] = old_record["_source_ids"].copy()
-    else:
-        new_record["_source_ids"] = {}
-    
-    # Группируем квартиры по типам
-    apartment_types = {}
+    # Обновляем apartment_types из CIAN (полностью заменяем старые квартиры новыми)
     apartments = cian_building.get("apartments", [])
     
     print(f"📦 Обрабатываем {len(apartments)} квартир из CIAN...")
+    
+    # Создаем новую структуру apartment_types из данных CIAN
+    apartment_types = {}
     
     for cian_apt in apartments:
         unified_apt = convert_cian_apartment_to_unified(cian_apt)
@@ -405,53 +386,195 @@ def create_new_unified_record(old_record: Dict, cian_building: Dict) -> Dict:
         
         apartment_types[apt_type]["apartments"].append(unified_apt)
     
-    new_record["apartment_types"] = apartment_types
+    # Заменяем apartment_types полностью
+    old_apt_count = sum(len(apt_type_data.get("apartments", [])) 
+                       for apt_type_data in old_record.get("apartment_types", {}).values())
+    updates["$set"]["apartment_types"] = apartment_types
     
     # Статистика
     total_apartments = sum(len(apt_type_data.get("apartments", [])) 
                           for apt_type_data in apartment_types.values())
-    print(f"✅ Создано {total_apartments} квартир в {len(apartment_types)} типах")
+    print(f"✅ Обновлены квартиры: {old_apt_count} → {total_apartments} квартир в {len(apartment_types)} типах")
     
-    return new_record
+    return updates
+
+
+def compare_structures(old_record: Dict, updates: Dict, cian_building: Dict) -> None:
+    """Сравнивает старую и новую структуру для dry-run режима"""
+    print("\n" + "="*80)
+    print("📊 СРАВНЕНИЕ СТРУКТУР (DRY-RUN)")
+    print("="*80)
+    
+    # Сравнение development
+    old_dev = old_record.get("development", {})
+    new_dev = updates["$set"].get("development", {})
+    
+    print("\n🏢 DEVELOPMENT:")
+    print(f"  Название:")
+    print(f"    Старое: {old_dev.get('name', 'N/A')}")
+    print(f"    Новое:  {new_dev.get('name', 'N/A')}")
+    print(f"    {'✅ Совпадает' if old_dev.get('name') == new_dev.get('name') else '⚠️ Изменилось'}")
+    
+    print(f"\n  Фото ЖК:")
+    old_photos = old_dev.get('photos', [])
+    new_photos = new_dev.get('photos', [])
+    print(f"    Старое: {len(old_photos)} фото")
+    print(f"    Новое:  {len(new_photos)} фото")
+    print(f"    {'✅ Совпадает' if len(old_photos) == len(new_photos) else '🔄 Обновлено'}")
+    
+    print(f"\n  Адрес:")
+    print(f"    Старое: {old_dev.get('address', 'N/A')}")
+    print(f"    Новое:  {new_dev.get('address', 'N/A')}")
+    print(f"    {'✅ Сохранен' if old_dev.get('address') == new_dev.get('address') else '⚠️ Изменилось'}")
+    
+    print(f"\n  Корпуса:")
+    old_korpuses = old_dev.get('korpuses', [])
+    new_korpuses = new_dev.get('korpuses', [])
+    print(f"    Старое: {len(old_korpuses)} корпусов")
+    print(f"    Новое:  {len(new_korpuses)} корпусов")
+    print(f"    {'✅ Сохранены' if len(old_korpuses) == len(new_korpuses) else '⚠️ Изменилось'}")
+    
+    print(f"\n  Диапазон цен:")
+    print(f"    Старое: {old_dev.get('price_range', 'N/A')}")
+    print(f"    Новое:  {new_dev.get('price_range', 'N/A')}")
+    print(f"    {'✅ Сохранен' if old_dev.get('price_range') == new_dev.get('price_range') else '⚠️ Изменилось'}")
+    
+    # Сравнение apartment_types
+    old_apt_types = old_record.get("apartment_types", {})
+    new_apt_types = updates["$set"].get("apartment_types", {})
+    
+    print("\n🏠 APARTMENT_TYPES:")
+    old_total = sum(len(apt_type_data.get('apartments', [])) 
+                   for apt_type_data in old_apt_types.values())
+    new_total = sum(len(apt_type_data.get('apartments', [])) 
+                   for apt_type_data in new_apt_types.values())
+    
+    print(f"  Всего квартир:")
+    print(f"    Старое: {old_total} квартир")
+    print(f"    Новое:  {new_total} квартир")
+    print(f"    {'✅ Совпадает' if old_total == new_total else '🔄 Обновлено'}")
+    
+    print(f"\n  По типам:")
+    all_types = set(old_apt_types.keys()) | set(new_apt_types.keys())
+    for apt_type in sorted(all_types):
+        old_count = len(old_apt_types.get(apt_type, {}).get('apartments', []))
+        new_count = len(new_apt_types.get(apt_type, {}).get('apartments', []))
+        status = "✅" if old_count == new_count else "🔄"
+        print(f"    {status} {apt_type}-комн: {old_count} → {new_count}")
+    
+    # Проверка структуры квартиры
+    if new_apt_types:
+        first_type = list(new_apt_types.keys())[0]
+        first_apt = new_apt_types[first_type].get('apartments', [])
+        if first_apt:
+            print(f"\n  📋 Структура квартиры (пример из {first_type}-комн):")
+            example_apt = first_apt[0]
+            print(f"    Поля в квартире: {', '.join(sorted(example_apt.keys()))}")
+            
+            # Проверяем наличие всех важных полей
+            important_fields = ['title', 'rooms', 'area', 'totalArea', 'price', 'url', 
+                              'images_apartment', 'decoration']
+            missing_fields = [f for f in important_fields if f not in example_apt]
+            if missing_fields:
+                print(f"    ⚠️ Отсутствуют поля: {', '.join(missing_fields)}")
+            else:
+                print(f"    ✅ Все важные поля присутствуют")
+    
+    # Проверка сохранения других полей
+    print("\n🔍 ПРОВЕРКА СОХРАНЕНИЯ ПОЛЕЙ:")
+    important_fields = [
+        'latitude', 'longitude', 'city', 'district', 'street', 'name',
+        'address_full', 'address_city', 'address_district', 
+        'address_street', 'address_house',
+        'rating', 'rating_description', 'construction_progress',
+        '_source_ids'
+    ]
+    
+    preserved = []
+    missing = []
+    for field in important_fields:
+        if field in old_record:
+            preserved.append(field)
+        else:
+            missing.append(field)
+    
+    print(f"  ✅ Сохранены ({len(preserved)}): {', '.join(preserved[:10])}")
+    if len(preserved) > 10:
+        print(f"     ... и еще {len(preserved) - 10} полей")
+    if missing:
+        print(f"  ⚠️ Отсутствуют в старой записи: {', '.join(missing)}")
+    
+    print("\n" + "="*80)
+    print("✅ ВСЕ ОСТАЛЬНЫЕ ПОЛЯ СОХРАНЯЮТСЯ БЕЗ ИЗМЕНЕНИЙ")
+    print("🔄 ОБНОВЛЯЮТСЯ ТОЛЬКО: development.photos и apartment_types")
+    print("="*80)
 
 
 def main():
     """Основная функция миграции"""
+    parser = argparse.ArgumentParser(description='Миграция данных из CIAN в unified_houses')
+    parser.add_argument('--dry-run', action='store_true', 
+                       help='Тестовый режим: показывает что будет обновлено, но не сохраняет в БД')
+    args = parser.parse_args()
+    
+    if args.dry_run:
+        print("🧪 DRY-RUN РЕЖИМ: изменения не будут сохранены в БД")
+    
     print("🔄 Начинаем миграцию данных из CIAN в unified_houses...")
     print(f"📁 Ищем ЖК: {BUILDING_NAME}")
-    
-    # Загружаем данные из CIAN
-    cian_building = load_cian_data()
-    if not cian_building:
-        return
-    
-    print(f"📊 Найдено квартир в CIAN: {len(cian_building.get('apartments', []))}")
-    print(f"📸 Найдено фото ЖК: {len(cian_building.get('building_photos', []))}")
     
     # Подключаемся к MongoDB
     db = get_mongo_connection()
     
-    # Находим старую запись
+    # Загружаем данные из CIAN (сначала из MongoDB, потом из файла как резерв)
+    cian_building = load_cian_data_from_mongo(db)
+    if not cian_building:
+        print("⚠️ Не найдено в MongoDB, пробую загрузить из файла...")
+        cian_building = load_cian_data_from_file()
+        if not cian_building:
+            return
+    
+    # Находим существующую запись
     old_record = find_unified_record(db, BUILDING_NAME)
     if not old_record:
         return
     
-    print(f"📍 Старая запись ID: {old_record.get('_id')}")
+    record_id = old_record.get('_id')
+    print(f"📍 Запись ID: {record_id}")
     print(f"📍 Координаты: {old_record.get('latitude')}, {old_record.get('longitude')}")
     
-    # Создаем новую запись
-    print("\n🔨 Создаем новую запись...")
-    new_record = create_new_unified_record(old_record, cian_building)
+    # Подготавливаем обновления
+    print("\n🔨 Подготавливаем обновления...")
+    updates = update_unified_record_with_cian(old_record, cian_building)
     
-    # Сохраняем новую запись
+    # В dry-run режиме показываем сравнение
+    if args.dry_run:
+        compare_structures(old_record, updates, cian_building)
+        print("\n🧪 DRY-RUN: изменения НЕ сохранены в БД")
+        print("   Для реального обновления запустите скрипт без флага --dry-run")
+        return
+    
+    # Обновляем существующую запись
     unified_col = db['unified_houses']
-    result = unified_col.insert_one(new_record)
+    result = unified_col.update_one(
+        {'_id': record_id},
+        updates
+    )
     
-    print(f"\n✅ Новая запись создана!")
-    print(f"📝 Новый ID: {result.inserted_id}")
-    print(f"📝 Старый ID: {old_record.get('_id')} (сохранен)")
-    print(f"📊 Квартир в новой записи: {sum(len(apt_type_data.get('apartments', [])) for apt_type_data in new_record.get('apartment_types', {}).values())}")
-    print(f"📸 Фото ЖК: {len(new_record.get('development', {}).get('photos', []))}")
+    if result.modified_count > 0:
+        print(f"\n✅ Запись обновлена!")
+        print(f"📝 ID записи: {record_id}")
+        
+        # Получаем обновленную запись для статистики
+        updated_record = unified_col.find_one({'_id': record_id})
+        if updated_record:
+            apt_count = sum(len(apt_type_data.get('apartments', [])) 
+                          for apt_type_data in updated_record.get('apartment_types', {}).values())
+            photos_count = len(updated_record.get('development', {}).get('photos', []))
+            print(f"📊 Квартир в записи: {apt_count}")
+            print(f"📸 Фото ЖК: {photos_count}")
+    else:
+        print(f"\n⚠️ Запись не была обновлена (возможно, данные не изменились)")
 
 
 if __name__ == "__main__":

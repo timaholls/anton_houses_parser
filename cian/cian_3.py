@@ -16,12 +16,16 @@ import asyncio
 import json
 import logging
 import hashlib
+import os
+import re
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 from io import BytesIO
 import aiohttp
 from urllib.parse import urlparse
 from dotenv import load_dotenv
+from pymongo import MongoClient
 
 # Директория текущего скрипта
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -36,8 +40,9 @@ from s3_service import S3Service
 from watermark_on_save import upload_with_watermark
 
 INPUT_FILE = PROJECT_ROOT / "cian_buildings.json"
-OUTPUT_FILE = PROJECT_ROOT / "cian_apartments_data.json"
 PROGRESS_FILE = PROJECT_ROOT / "progress_cian_3.json"
+REPROCESS_FILE = PROJECT_ROOT / "buildings_to_reprocess.json"
+MONGO_COLLECTION_NAME = "unified_houses_2"
 
 # Настройка логгера
 logger = logging.getLogger(__name__)
@@ -74,15 +79,44 @@ def load_buildings(path: str = str(INPUT_FILE)) -> List[Dict[str, Any]]:
         return []
 
 
-def save_data(data: List[Dict[str, Any]], path: str = str(OUTPUT_FILE)) -> None:
-    """Сохраняет данные в JSON файл."""
+def load_buildings_to_reprocess(path: str = str(REPROCESS_FILE)) -> Optional[List[Dict[str, str]]]:
+    """Загружает список ЖК для повторной обработки."""
+    if not Path(path).exists():
+        return None
+
     try:
-        tmp_path = str(path) + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        Path(tmp_path).replace(path)
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return data
+        return None
     except Exception as e:
-        print(f"Ошибка при сохранении файла {path}: {e}")
+        print(f"Ошибка при чтении файла {path}: {e}")
+        return None
+
+
+def filter_buildings_by_reprocess_list(
+    buildings: List[Dict[str, Any]], 
+    reprocess_list: List[Dict[str, str]]
+) -> List[Dict[str, Any]]:
+    """Фильтрует список ЖК, оставляя только те, что есть в списке для повторной обработки."""
+    if not reprocess_list:
+        return buildings
+    
+    # Создаем множество названий и ссылок для быстрого поиска
+    reprocess_titles = {item.get("title") for item in reprocess_list}
+    reprocess_links = {item.get("link") for item in reprocess_list}
+    
+    filtered = []
+    for building in buildings:
+        building_title = building.get('title', '')
+        building_link = building.get('link', '')
+        
+        # Проверяем по названию или ссылке
+        if building_title in reprocess_titles or building_link in reprocess_links:
+            filtered.append(building)
+    
+    return filtered
 
 
 def load_progress(path: str = str(PROGRESS_FILE)) -> Dict[str, int]:
@@ -113,6 +147,281 @@ def save_progress(building_index: int, apartment_index: int, path: str = str(PRO
     except Exception as e:
         print(f"Ошибка при сохранении прогресса {path}: {e}")
 
+
+def ensure_factoid(factoids: List[Dict[str, Any]], label: str, value: Optional[str]) -> None:
+    """Добавляет или обновляет значение в массиве factoids."""
+    if not value:
+        return
+    for item in factoids:
+        if item.get("label") == label:
+            item["value"] = value
+            return
+    factoids.append({"label": label, "value": value})
+
+
+def create_mongo_connection():
+    """Создает подключение к MongoDB и возвращает клиент и коллекцию."""
+    mongo_uri = os.getenv("MONGO_URI", "mongodb://root:Kfleirb_17@176.98.177.188:27017/admin")
+    db_name = os.getenv("DB_NAME", "houses")
+    client = MongoClient(mongo_uri)
+    collection = client[db_name][MONGO_COLLECTION_NAME]
+    return client, collection
+
+
+def upsert_building_data(collection, building_data: Dict[str, Any]) -> None:
+    """Сохраняет данные ЖК в коллекцию MongoDB."""
+    if collection is None or not building_data:
+        return
+
+    building_link = building_data.get("building_link")
+    building_title = building_data.get("building_title")
+
+    if not building_link and not building_title:
+        logger.warning("Пропускаем апдейт MongoDB — отсутствуют building_link и building_title")
+        return
+
+    document = dict(building_data)
+    document["source"] = "cian"
+    document["updatedAt"] = datetime.now(timezone.utc).isoformat()
+
+    query = {"building_link": building_link} if building_link else {"building_title": building_title}
+
+    try:
+        collection.replace_one(query, document, upsert=True)
+    except Exception as e:
+        logger.error(f"Ошибка при сохранении ЖК в MongoDB: {e}")
+
+
+def load_building_record(collection, building_title: str, building_link: str, building_photos: List[str]) -> Dict[str, Any]:
+    """Загружает существующую запись ЖК из MongoDB или создает новую структуру."""
+    base_data = {
+        "building_title": building_title,
+        "building_link": building_link,
+        "building_photos": building_photos,
+        "apartments": []
+    }
+
+    if collection is None:
+        return base_data
+
+    try:
+        query = {"building_link": building_link} if building_link else {"building_title": building_title}
+        existing = collection.find_one(query, projection={"_id": 0})
+        if existing:
+            existing.setdefault("building_title", building_title)
+            existing.setdefault("building_link", building_link)
+            existing.setdefault("building_photos", building_photos)
+            existing.setdefault("apartments", [])
+            return existing
+    except Exception as e:
+        logger.error(f"Ошибка чтения ЖК из MongoDB: {e}")
+
+    return base_data
+
+
+def save_building_state(building_data: Dict[str, Any], collection) -> None:
+    """Сохраняет текущее состояние ЖК в MongoDB."""
+    if building_data:
+        upsert_building_data(collection, building_data)
+
+
+def upsert_apartment_entry(building_data: Dict[str, Any], apartment_entry: Dict[str, Any]) -> bool:
+    """
+    Добавляет или обновляет запись квартиры в текущем объекте ЖК.
+    Возвращает True, если добавлена новая запись (для статистики).
+    """
+    if not building_data:
+        return False
+
+    apartments = building_data.setdefault("apartments", [])
+    apartment_url = apartment_entry.get("url")
+
+    if apartment_url:
+        for idx, existing in enumerate(apartments):
+            if existing.get("url") == apartment_url:
+                apartments[idx] = apartment_entry
+                return False
+
+    apartments.append(apartment_entry)
+    return True
+
+
+async def mark_apartment_processed(building_idx: int, apartment_index: int, progress_state: Dict[str, Any],
+                                   progress_lock: asyncio.Lock) -> None:
+    """
+    Отмечает квартиру как обработанную и обновляет файл прогресса,
+    когда сформирована непрерывная последовательность обработанных квартир.
+    """
+    async with progress_lock:
+        progress_state["processed_flags"][apartment_index] = True
+        current_pointer = progress_state["next_index"]
+
+        while progress_state["processed_flags"].get(current_pointer, False):
+            current_pointer += 1
+
+        if current_pointer != progress_state["next_index"]:
+            progress_state["next_index"] = current_pointer
+            save_progress(building_idx, current_pointer)
+
+
+async def increment_stat(stats: Dict[str, int], stats_lock: asyncio.Lock, field: str, delta: int = 1) -> None:
+    """Потокобезопасно увеличивает счетчик статистики."""
+    async with stats_lock:
+        stats[field] = stats.get(field, 0) + delta
+
+
+async def apartment_worker(
+    worker_id: int,
+    apartment_queue: asyncio.Queue,
+    building_idx: int,
+    building_title: str,
+    building_data: Dict[str, Any],
+    mongo_collection,
+    progress_state: Dict[str, Any],
+    progress_lock: asyncio.Lock,
+    building_lock: asyncio.Lock,
+    stats: Dict[str, int],
+    stats_lock: asyncio.Lock,
+    headless: bool = False,
+) -> None:
+    """Воркера, который обрабатывает квартиры из очереди с собственным браузером."""
+
+    browser, proxy_url = await create_browser(headless=headless)
+    page = await create_browser_page(browser, set_domclick_cookies=False)
+
+    async def store_entry(entry: Dict[str, Any]) -> None:
+        async with building_lock:
+            is_new = upsert_apartment_entry(building_data, entry)
+            save_building_state(building_data, mongo_collection)
+        if is_new:
+            await increment_stat(stats, stats_lock, "new_entries", 1)
+
+    try:
+        while True:
+            task = await apartment_queue.get()
+            if task is None:
+                apartment_queue.task_done()
+                print(f"    [Browser {worker_id}] Завершил работу (нет задач)")
+                break
+
+            apartment_index, apartment_url = task
+            print(
+                f"    [Browser {worker_id}] → обрабатываю квартиру {apartment_index + 1}: {apartment_url}"
+            )
+            retry_count = 0
+            max_retries = 3
+            success = False
+            last_error: Optional[Exception] = None
+
+            try:
+                while retry_count < max_retries and not success:
+                    try:
+                        page_closed = False
+                        try:
+                            if page.isClosed():
+                                page_closed = True
+                        except Exception:
+                            page_closed = True
+
+                        if page_closed:
+                            print(f"    [Browser {worker_id}] Страница закрыта, перезапускаю браузер...")
+                            browser, page, proxy_url = await restart_browser(
+                                browser, headless=headless, set_domclick_cookies=False
+                            )
+                            await asyncio.sleep(3)
+
+                        apartment_data = await parse_apartment_page(page, apartment_url)
+
+                        if apartment_data.get("title") or apartment_data.get("price") or apartment_data.get("factoids"):
+                            await store_entry(apartment_data)
+                            await mark_apartment_processed(
+                                building_idx, apartment_index, progress_state, progress_lock
+                            )
+                            print(
+                                f"    [Browser {worker_id}] ✓ Сохранено: "
+                                f"{apartment_data.get('title', 'Без названия')}"
+                            )
+                            success = True
+                        else:
+                            raise Exception("Не удалось собрать данные с страницы (пустой результат)")
+
+                    except Exception as e:
+                        last_error = e
+                        error_str = str(e)
+                        print(f"    [Browser {worker_id}] ✗ Ошибка при парсинге квартиры: {e}")
+
+                        is_proxy_error = "ERR_PROXY_CONNECTION_FAILED" in error_str or "proxy" in error_str.lower()
+                        page_closed_check = False
+                        try:
+                            page_closed_check = page.isClosed()
+                        except Exception:
+                            page_closed_check = True
+                        is_session_error = (
+                            "сессия закрыта" in error_str.lower()
+                            or "session closed" in error_str.lower()
+                            or "target closed" in error_str.lower()
+                            or "page closed" in error_str.lower()
+                            or page_closed_check
+                        )
+                        is_connection_error = (
+                            "connection" in error_str.lower()
+                            or "timeout" in error_str.lower()
+                            or "network" in error_str.lower()
+                        )
+
+                        if is_proxy_error or is_session_error or is_connection_error:
+                            print(
+                                f"    [Browser {worker_id}] Ошибка подключения/прокси, перезапускаю браузер "
+                                f"с новым прокси..."
+                            )
+                            try:
+                                await asyncio.sleep(3)
+                                browser, page, proxy_url = await restart_browser(
+                                    browser, headless=headless, set_domclick_cookies=False
+                                )
+                                print(
+                                    f"    [Browser {worker_id}] ✓ Браузер перезапущен с новым прокси: {proxy_url}"
+                                )
+                                await asyncio.sleep(3)
+                                continue
+                            except Exception as restart_error:
+                                print(
+                                    f"    [Browser {worker_id}] ✗ Ошибка перезапуска браузера: {restart_error}"
+                                )
+                                last_error = restart_error
+                                retry_count += 1
+                                if retry_count < max_retries:
+                                    await asyncio.sleep(5)
+                                    continue
+                                else:
+                                    break
+
+                        retry_count += 1
+                        if retry_count < max_retries:
+                            wait_time = min(5 * retry_count, 15)
+                            print(
+                                f"    [Browser {worker_id}] Попытка {retry_count}/{max_retries}. "
+                                f"Пауза {wait_time} секунд..."
+                            )
+                            await asyncio.sleep(wait_time)
+
+                if not success:
+                    error_entry = {
+                        "url": apartment_url,
+                        "error": str(last_error) if last_error else "Неизвестная ошибка",
+                    }
+                    await store_entry(error_entry)
+                    await mark_apartment_processed(building_idx, apartment_index, progress_state, progress_lock)
+                    print(
+                        f"    [Browser {worker_id}] ✗ Все попытки исчерпаны, пропускаю квартиру: {apartment_url}"
+                    )
+
+            finally:
+                apartment_queue.task_done()
+                await asyncio.sleep(1)  # Небольшая пауза между квартирами
+
+    finally:
+        await browser.close()
 
 async def download_and_process_image(session: aiohttp.ClientSession, image_url: str, apartment_id: str,
                                      image_type: str = "main") -> Optional[str]:
@@ -154,6 +463,7 @@ async def parse_apartment_page(page, apartment_url: str) -> Dict[str, Any]:
         "price_per_square": "",
         "factoids": [],
         "summary_info": [],
+        "description": "",
         "decoration": {
             "description": "",
             "photos": []
@@ -174,6 +484,7 @@ async def parse_apartment_page(page, apartment_url: str) -> Dict[str, Any]:
 
         # Используем 'domcontentloaded' вместо полной загрузки страницы
         await page.goto(apartment_url, waitUntil='domcontentloaded', timeout=60000)
+        print(f"        → loaded domcontent {apartment_url}")
         
         # Ждем появления ключевых элементов вместо полной загрузки страницы
         # Пробуем дождаться хотя бы одного из основных элементов
@@ -191,7 +502,7 @@ async def parse_apartment_page(page, apartment_url: str) -> Dict[str, Any]:
         await asyncio.sleep(1)
 
         # Парсим данные через JavaScript
-        script = """
+        script = r"""
         () => {
           const result = {
             title: "",
@@ -200,6 +511,7 @@ async def parse_apartment_page(page, apartment_url: str) -> Dict[str, Any]:
             price_per_square: "",
             factoids: [],
             summary_info: [],
+            description: "",
             decoration: {
               description: "",
               photos: []
@@ -210,6 +522,12 @@ async def parse_apartment_page(page, apartment_url: str) -> Dict[str, Any]:
           const titleElement = document.querySelector('[data-name="OfferTitleNew"]');
           if (titleElement) {
             result.title = titleElement.textContent.trim();
+          }
+
+          // 2.7. Описание из блока Description
+          const descriptionBlock = document.querySelector('[data-name="Description"] [data-id="content"], [data-id="content"]');
+          if (descriptionBlock) {
+            result.description = descriptionBlock.textContent.trim();
           }
           
           // 2. Первая фотография из галереи
@@ -373,6 +691,24 @@ async def parse_apartment_page(page, apartment_url: str) -> Dict[str, Any]:
             desc = ' '.join(desc.split())
             apartment_data["decoration"]["description"] = desc
 
+        # Описание квартиры (из блока Description)
+        if apartment_data.get("description"):
+            description_text = apartment_data["description"]
+            description_text = description_text.replace('\u00A0', ' ')
+            description_text = description_text.replace('&nbsp;', ' ')
+            description_text = description_text.replace('\u2009', ' ')
+            description_text = description_text.replace('\u2007', ' ')
+            description_text = description_text.replace('\u202F', ' ')
+            description_text = ' '.join(description_text.split())
+            apartment_data["description"] = description_text
+
+            # Пытаемся извлечь срок сдачи из описания
+            match = re.search(r'срок\s+сдачи[:\s]*([^.,\\n]+)', description_text, re.IGNORECASE)
+            if match:
+                completion_value = match.group(1).strip()
+                completion_value = completion_value.rstrip(' ,.;')
+                ensure_factoid(apartment_data["factoids"], "Срок сдачи", completion_value)
+
         # Обрабатываем и загружаем фотографии
         # Создаем уникальный ID квартиры: извлекаем ID из пути и добавляем короткий хеш URL для уникальности
         parsed_url = urlparse(apartment_url)
@@ -429,32 +765,54 @@ async def run() -> None:
         print("Файл со списком ЖК пуст или отсутствует")
         return
 
+    # Проверяем, есть ли файл со списком для повторной обработки
+    reprocess_list = load_buildings_to_reprocess()
+    if reprocess_list:
+        print(f"Найден файл со списком ЖК для повторной обработки: {REPROCESS_FILE}")
+        print(f"ЖК в списке для повторной обработки: {len(reprocess_list)}")
+        buildings = filter_buildings_by_reprocess_list(buildings, reprocess_list)
+        print(f"После фильтрации осталось ЖК для обработки: {len(buildings)}")
+        if not buildings:
+            print("Нет ЖК для обработки после фильтрации. Удалите файл buildings_to_reprocess.json для обработки всех ЖК.")
+            return
+        # Сбрасываем прогресс при работе со списком повторной обработки
+        print("Сбрасываю прогресс для обработки списка повторной обработки")
+        start_building_index = 0
+        start_apartment_index = 0
+    else:
+        # Загружаем прогресс только если нет списка для повторной обработки
+        progress = load_progress()
+        start_building_index = progress["building_index"]
+        start_apartment_index = progress["apartment_index"]
+
     print(f"Загружено ЖК: {len(buildings)}")
 
-    # Загружаем прогресс
-    progress = load_progress()
-    start_building_index = progress["building_index"]
-    start_apartment_index = progress["apartment_index"]
-
-    if start_building_index > 0 or start_apartment_index > 0:
-        print(f"Продолжаю с ЖК #{start_building_index + 1}, квартира #{start_apartment_index + 1}")
+    if not reprocess_list:
+        if start_building_index > 0 or start_apartment_index > 0:
+            print(f"Продолжаю с ЖК #{start_building_index + 1}, квартира #{start_apartment_index + 1}")
+        else:
+            print(f"Начинаю с начала")
     else:
-        print(f"Начинаю с начала")
+        print(f"Начинаю обработку списка повторной обработки с начала")
 
-    # Загружаем существующие данные или создаем новый список
-    result_data = []
-    if Path(OUTPUT_FILE).exists():
-        try:
-            with open(OUTPUT_FILE, "r", encoding="utf-8") as f:
-                result_data = json.load(f)
-        except Exception:
-            result_data = []
+    # Создаем подключения
+    mongo_client = None
+    mongo_collection = None
+    try:
+        mongo_client, mongo_collection = create_mongo_connection()
+    except Exception as e:
+        print(f"⚠️ Не удалось подключиться к MongoDB: {e}")
+        mongo_client = None
+        mongo_collection = None
 
-    # Создаем браузер
-    browser, proxy_url = await create_browser(headless=False)
-    page = await create_browser_page(browser, set_domclick_cookies=False)
+    if mongo_collection is None:
+        print("Нет подключения к MongoDB. Останавливаю работу.")
+        return
 
     try:
+        processed_buildings = 0
+        total_new_apartments = 0
+
         for building_idx in range(start_building_index, len(buildings)):
             building = buildings[building_idx]
             building_title = building.get('title', f'ЖК #{building_idx + 1}')
@@ -463,147 +821,85 @@ async def run() -> None:
 
             if not apartments_links:
                 print(f"\n[{building_idx + 1}/{len(buildings)}] {building_title}: нет ссылок на квартиры")
+                save_progress(building_idx + 1, 0)
+                processed_buildings += 1
                 continue
 
             print(f"\n[{building_idx + 1}/{len(buildings)}] {building_title}: {len(apartments_links)} квартир")
 
-            # Ищем или создаем запись для этого ЖК
-            building_data = None
-            for bd in result_data:
-                if bd.get("building_link") == building_link:
-                    building_data = bd
-                    break
+            building_photos = building.get('photos', [])
+            building_data = load_building_record(mongo_collection, building_title, building_link, building_photos)
 
-            if not building_data:
-                # Получаем фотографии ЖК из исходных данных
-                building_photos = building.get('photos', [])
-                building_data = {
-                    "building_title": building_title,
-                    "building_link": building_link,
-                    "building_photos": building_photos,  # Фотографии ЖК
-                    "apartments": []
-                }
-                result_data.append(building_data)
-
-            # Парсим квартиры
             start_idx = start_apartment_index if building_idx == start_building_index else 0
+
+            if start_idx >= len(apartments_links):
+                print("  Все квартиры уже обработаны ранее для этого ЖК.")
+                save_progress(building_idx + 1, 0)
+                processed_buildings += 1
+                start_apartment_index = 0
+                continue
+
+            apartment_queue: asyncio.Queue = asyncio.Queue()
             for apt_idx in range(start_idx, len(apartments_links)):
-                apartment_url = apartments_links[apt_idx]
-                print(f"  Квартира {apt_idx + 1}/{len(apartments_links)}: {apartment_url}")
+                await apartment_queue.put((apt_idx, apartments_links[apt_idx]))
 
-                max_retries = 3
-                retry_count = 0
-                success = False
+            worker_count = min(5, apartment_queue.qsize())
+            if worker_count == 0:
+                print(f"  Нет квартир для обработки после индекса {start_idx}.")
+                save_progress(building_idx + 1, 0)
+                processed_buildings += 1
+                start_apartment_index = 0
+                continue
 
-                while retry_count < max_retries and not success:
-                    try:
-                        # Проверяем, что страница не закрыта перед использованием
-                        page_closed = False
-                        try:
-                            if page.isClosed():
-                                page_closed = True
-                        except Exception:
-                            # Если проверка не удалась, считаем страницу закрытой
-                            page_closed = True
+            print(
+                f"  Запускаю {worker_count} браузеров для обработки {apartment_queue.qsize()} квартир "
+                f"(начиная с #{start_idx + 1})"
+            )
 
-                        if page_closed:
-                            print(f"    Страница закрыта, перезапускаю браузер...")
-                            browser, page, proxy_url = await restart_browser(browser, headless=False,
-                                                                             set_domclick_cookies=False)
-                            await asyncio.sleep(3)  # Пауза после перезапуска
+            progress_state = {
+                "processed_flags": {idx: True for idx in range(start_idx)},
+                "next_index": start_idx
+            }
+            building_lock = asyncio.Lock()
+            progress_lock = asyncio.Lock()
+            stats_lock = asyncio.Lock()
+            building_stats = {"new_entries": 0}
 
-                        apartment_data = await parse_apartment_page(page, apartment_url)
+            for _ in range(worker_count):
+                await apartment_queue.put(None)
 
-                        # Проверяем, что данные действительно собраны (есть хотя бы title или другие поля)
-                        if apartment_data.get("title") or apartment_data.get("price") or apartment_data.get("factoids"):
-                            building_data["apartments"].append(apartment_data)
-                            # Сохраняем данные и прогресс после каждой квартиры
-                            save_progress(building_idx, apt_idx + 1)
-                            save_data(result_data)
-                            print(f"    ✓ Сохранено: {apartment_data.get('title', 'Без названия')}")
-                            success = True
-                        else:
-                            # Если данных нет, считаем это ошибкой и пробуем снова
-                            raise Exception("Не удалось собрать данные с страницы (пустой результат)")
+            workers = [
+                asyncio.create_task(
+                    apartment_worker(
+                        worker_id=i + 1,
+                        apartment_queue=apartment_queue,
+                        building_idx=building_idx,
+                        building_title=building_title,
+                        building_data=building_data,
+                        mongo_collection=mongo_collection,
+                        progress_state=progress_state,
+                        progress_lock=progress_lock,
+                        building_lock=building_lock,
+                        stats=building_stats,
+                        stats_lock=stats_lock,
+                        headless=False,
+                    )
+                )
+                for i in range(worker_count)
+            ]
 
-                    except Exception as e:
-                        error_str = str(e)
-                        print(f"    ✗ Ошибка при парсинге квартиры: {e}")
+            await asyncio.gather(*workers)
 
-                        # Проверяем тип ошибки
-                        is_proxy_error = "ERR_PROXY_CONNECTION_FAILED" in error_str or "proxy" in error_str.lower()
-                        # Проверяем, закрыта ли страница
-                        page_closed_check = False
-                        try:
-                            page_closed_check = page.isClosed()
-                        except Exception:
-                            page_closed_check = True
-                        is_session_error = "сессия закрыта" in error_str.lower() or "session closed" in error_str.lower() or "Target closed" in error_str or "page closed" in error_str.lower() or page_closed_check
-                        is_connection_error = "connection" in error_str.lower() or "timeout" in error_str.lower() or "network" in error_str.lower()
-
-                        # Если ошибка прокси или сессии, СРАЗУ перезапускаем браузер и пробуем снова (не считаем как попытку)
-                        if is_proxy_error or is_session_error or is_connection_error:
-                            print(f"    Ошибка подключения/прокси, перезапускаю браузер с новым прокси...")
-                            try:
-                                await asyncio.sleep(3)  # Пауза перед перезапуском
-                                browser, page, proxy_url = await restart_browser(browser, headless=False,
-                                                                                 set_domclick_cookies=False)
-                                print(f"    ✓ Браузер перезапущен с новым прокси: {proxy_url}")
-                                await asyncio.sleep(3)  # Пауза после перезапуска
-                                continue  # Пробуем снова БЕЗ увеличения счетчика попыток
-                            except Exception as restart_error:
-                                print(f"    ✗ Ошибка перезапуска браузера: {restart_error}")
-                                retry_count += 1
-                                if retry_count < max_retries:
-                                    await asyncio.sleep(5)  # Пауза перед следующей попыткой перезапуска
-                                    continue
-                                else:
-                                    # Если не удалось перезапустить после нескольких попыток
-                                    building_data["apartments"].append({
-                                        "url": apartment_url,
-                                        "error": f"Не удалось перезапустить браузер: {restart_error}"
-                                    })
-                                    save_progress(building_idx, apt_idx + 1)
-                                    save_data(result_data)
-                                    print(f"    ✗ Не удалось перезапустить браузер, пропускаю эту квартиру")
-                                    await asyncio.sleep(2)
-                                    break
-
-                        # Для других ошибок увеличиваем счетчик попыток
-                        retry_count += 1
-                        print(f"    Попытка {retry_count}/{max_retries}")
-
-                        # Если все попытки исчерпаны
-                        if retry_count >= max_retries:
-                            # Добавляем пустую запись с ошибкой
-                            building_data["apartments"].append({
-                                "url": apartment_url,
-                                "error": str(e)
-                            })
-                            save_progress(building_idx, apt_idx + 1)
-                            save_data(result_data)
-                            print(f"    ✗ Все попытки исчерпаны, пропускаю эту квартиру")
-                            await asyncio.sleep(2)  # Пауза перед следующей квартирой
-                        else:
-                            # Пауза перед следующей попыткой
-                            wait_time = min(5 * retry_count, 15)  # Увеличиваем паузу с каждой попыткой (до 15 сек)
-                            print(f"    Пауза {wait_time} секунд перед следующей попыткой...")
-                            await asyncio.sleep(wait_time)
-
-                # Пауза между квартирами для снижения нагрузки
-                await asyncio.sleep(1)
-
-            # Сбрасываем индекс квартиры для следующего ЖК
-            start_apartment_index = 0
             save_progress(building_idx + 1, 0)
+            processed_buildings += 1
+            total_new_apartments += building_stats.get("new_entries", 0)
+            start_apartment_index = 0
 
         print(f"\n✓ Обработка завершена")
         print(f"Итоговая статистика:")
-        total_apartments = sum(len(bd.get("apartments", [])) for bd in result_data)
-        print(f"  ЖК обработано: {len(result_data)}")
-        print(f"  Всего квартир: {total_apartments}")
+        print(f"  ЖК обработано (за текущий запуск): {processed_buildings}")
+        print(f"  Новых записей квартир (включая обновления): {total_new_apartments}")
 
-        # Удаляем файл прогресса после успешного завершения
         if Path(PROGRESS_FILE).exists():
             try:
                 Path(PROGRESS_FILE).unlink()
@@ -612,8 +908,9 @@ async def run() -> None:
                 pass
 
     finally:
-        await browser.close()
+        if mongo_client:
+            mongo_client.close()
 
 
 if __name__ == "__main__":
-    asyncio.get_event_loop().run_until_complete(run())
+    asyncio.run(run())
